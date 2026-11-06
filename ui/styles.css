@@ -39,6 +39,14 @@
   box-sizing: border-box;
 }
 
+/* 浮层用 HTML 的 hidden 属性控制显隐，但下面 .lightbox/.toast/.menu 等
+   作者样式里的 display 会压过浏览器默认的 [hidden] { display: none }，
+   导致 .lightbox 的 90% 黑色遮罩在启动时就盖住整个界面（一片黑）。
+   这里显式兜底，保证 hidden 属性始终生效。 */
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   margin: 0;
@@ -1051,14 +1059,21 @@ select {
 /* ---------------------------------------------------------------- 浮层 */
 
 .lightbox {
+  /* 默认状态显式隐藏：不依赖浏览器对 hidden 属性的默认样式，
+     避免任何选择器优先级问题让遮罩在启动时盖住整个窗口。 */
+  display: none;
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.9);
-  display: grid;
   place-items: center;
   z-index: 100;
   cursor: zoom-out;
   padding: 40px;
+}
+
+/* 只有 openLightbox() 移除 hidden 属性后才真正显示 */
+.lightbox:not([hidden]) {
+  display: grid;
 }
 
 .lightbox img {
