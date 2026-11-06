@@ -130,6 +130,7 @@ const state = {
   // 后端诊断
   onlineError: "",
   adminKeyReady: true,
+  diagnostic: null,
   // DOM 缓存
   dom: null,
   stageRoute: null,
@@ -181,14 +182,30 @@ async function loadAccounts(force, silent) {
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
     state.onlineError = msg;
-    if (msg.includes("后端未连接")) state.online = false;
-    else {
+    if (msg.includes("后端未连接")) {
+      state.online = false;
+      runDiagnostic();
+    } else {
       state.online = true;
       toast(msg, true);
     }
   } finally {
     state.loadingAccounts = false;
     if (!silent) render();
+  }
+}
+
+/** 离线时补一层端口探测，区分「后端没启动」和「代理/防火墙拦截」。 */
+async function runDiagnostic() {
+  try {
+    const d = await call("diagnose_backend");
+    state.diagnostic = d;
+    if (d.data_dir) state.dataDir = d.data_dir;
+    state.adminKeyReady = !!d.admin_key_ready;
+    // 导入页有表单，别让异步诊断回来时全量重建 textarea。
+    if (state.route === "home") render();
+  } catch (e) {
+    // 浏览器预览模式没有 Tauri，忽略即可。
   }
 }
 
@@ -348,11 +365,11 @@ function buildHome(stage) {
   expandBtn.hidden = !collapsed;
   const title = el("div", { class: "chat-title", text: "图像" });
   const sub = el("div", { class: "chat-sub", text: "描述画面，或上传参考图继续修改" });
-  const offline = el("div", { class: "notice", hidden: true });
+  // 诊断横幅独占一整行：塞进 chat-head-actions 会被标题栏挤成竖排单字。
+  const offline = el("div", { class: "notice notice-wide", hidden: true });
   const head = el("div", { class: "chat-head" }, [
     expandBtn,
     el("div", { class: "chat-head-copy" }, [title, sub]),
-    el("div", { class: "chat-head-actions" }, [offline]),
   ]);
 
   const scroll = el("div", { class: "chat-scroll" });
@@ -361,6 +378,7 @@ function buildHome(stage) {
 
   const composer = buildComposer();
   main.appendChild(head);
+  main.appendChild(offline);
   main.appendChild(scroll);
   main.appendChild(composer.wrap);
 
@@ -871,43 +889,63 @@ function updateComposer() {
     d.offline.innerHTML = "";
     const offline = state.online === false;
     const auth = /40[13]/.test(state.onlineError);
+    const diag = state.diagnostic;
+    const noListener = !!(diag && !diag.port_listening);
     const title = offline
-      ? "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务。"
+      ? noListener
+        ? `本机后端未启动（${diag.endpoint} 无人监听），生图与导入入池都不可用。`
+        : "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务。"
       : auth
         ? "后端在线，但 admin-key 校验失败。账号列表为空不是「没有账号」。"
         : "后端已连通，但账号信息读取失败。";
     // 把「正在查找的完整路径」写出来：只说「检查后端数据目录」用户根本
     // 无从下手，Windows 上后端装到别处时也能一眼看出该改哪个环境变量。
-    const keyPath = `${state.dataDir || "(未知数据目录)"}/admin-key`;
-    d.offline.appendChild(
-      el("div", { class: "notice-copy" }, [
-        el("div", { class: "notice-title", text: title }),
-        el("div", {
-          class: "notice-detail",
-          text: [
-            `连接地址 ${state.baseUrl || "http://127.0.0.1:38650"}`,
-            state.adminKeyReady ? "admin-key 已找到" : `admin-key 未找到：${keyPath}`,
-          ].join(" · "),
-        }),
-        el("div", { class: "notice-detail", text: `底层错误：${state.onlineError || "连接被拒绝"}` }),
-      ])
-    );
+    const keyPath = (diag && diag.admin_key_path) || `${state.dataDir || "(未知数据目录)"}/admin-key`;
+    const details = [
+      el("div", { class: "notice-title", text: title }),
+      el("div", {
+        class: "notice-detail",
+        text: [
+          `连接地址 ${state.baseUrl || "http://127.0.0.1:38650"}`,
+          state.adminKeyReady ? "admin-key 已找到" : `admin-key 未找到：${keyPath}`,
+        ].join(" · "),
+      }),
+      el("div", { class: "notice-detail", text: `底层错误：${state.onlineError || "连接被拒绝"}` }),
+    ];
+    if (diag) {
+      details.push(el("div", { class: "notice-detail", text: `端口探测：${diag.port_detail}` }));
+      details.push(el("div", { class: "notice-advice", text: `建议：${diag.advice}` }));
+    }
+    d.offline.appendChild(el("div", { class: "notice-copy" }, details));
     d.offline.appendChild(
       el("div", { class: "notice-actions" }, [
-        el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) }),
+        el("button", { class: "btn", text: "重新连接", onclick: () => { state.diagnostic = null; loadAccounts(false); } }),
+        el("button", {
+          class: "btn",
+          text: "打开数据目录",
+          onclick: () => call("open_data_dir").catch((e) => toast(String(e), true)),
+        }),
         el("button", {
           class: "btn",
           text: "复制诊断",
-          onclick: () => {
-            const diag = [
+          onclick: async () => {
+            let dg = state.diagnostic;
+            if (!dg) {
+              try { dg = await call("diagnose_backend"); state.diagnostic = dg; } catch (e) {}
+            }
+            const diagText = [
               `GPT Image Free v${state.version}`,
               `连接地址：${state.baseUrl || "http://127.0.0.1:38650"}`,
               `数据目录：${state.dataDir || "未知"}`,
               `admin-key：${state.adminKeyReady ? "已找到" : `未找到（${keyPath}）`}`,
               `底层错误：${state.onlineError || "连接被拒绝"}`,
+              dg ? `端口探测：${dg.port_detail}` : "端口探测：未执行",
+              dg ? `数据目录存在：${dg.data_dir_exists ? "是" : "否"}` : "",
+              dg ? `source/ 存在：${dg.source_dir_exists ? "是" : "否"}` : "",
+              dg ? `建议：${dg.advice}` : "",
               `平台：${navigator.userAgent}`,
-            ].join("\n");
-            copy(diag);
+            ].filter(Boolean).join("\n");
+            copy(diagText);
           },
         }),
       ])
@@ -2032,6 +2070,23 @@ function renderSettings(stage) {
     el("button", { class: "switch" + (state.settings.auto_check_update ? " on" : ""), role: "switch", onclick: () => saveSettings({ auto_check_update: !state.settings.auto_check_update }) }),
   ]));
   section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [
+      el("div", { class: "field-label", text: "后端连接地址" }),
+      el("div", { class: "field-hint", text: "默认 http://127.0.0.1:38650。若后端在别的端口、另一台机器或用其它方式部署，改成实际地址后会自动重连。" }),
+    ]),
+    el("input", {
+      class: "input",
+      value: state.settings.base_url || "",
+      placeholder: "http://127.0.0.1:38650",
+      onchange: async (e) => {
+        const v = String(e.target.value || "").trim() || "http://127.0.0.1:38650";
+        await saveSettings({ base_url: v });
+        state.diagnostic = null;
+        loadAccounts(false);
+      },
+    }),
+  ]));
+  section.appendChild(el("div", { class: "field" }, [
     el("div", {}, [el("div", { class: "field-label", text: "图片保存目录" }), el("div", { class: "field-hint", text: state.imagesDir || "" })]),
     el("button", { class: "btn", text: "打开文件夹", onclick: () => call("reveal_images").catch((e) => toast(String(e), true)) }),
   ]));
@@ -2049,6 +2104,7 @@ function renderSettings(stage) {
 async function saveSettings(patch) {
   const next = Object.assign({}, state.settings, patch);
   state.settings = next;
+  if (next.base_url) state.baseUrl = next.base_url;
   try {
     state.settings = await call("save_settings", { settings: next });
     toast("已保存");

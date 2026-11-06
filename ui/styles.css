@@ -1109,7 +1109,7 @@ a.icon-btn {
 
 .notice {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
   padding: 10px 14px;
   border-radius: var(--r-md);
@@ -1128,8 +1128,18 @@ a.icon-btn {
 
 .notice-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
   flex-shrink: 0;
+}
+
+.notice-advice {
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--text-dim);
+  word-break: break-word;
 }
 
 .notice-title {
@@ -1517,17 +1527,22 @@ a.icon-btn {
   gap: 8px;
 }
 
-.chat-head-actions .notice {
-  margin: 0;
-  padding: 5px 10px;
-  font-size: 11.5px;
+/* 离线诊断横幅独占一整行；窄窗口时按钮区整体换行到文字下方 */
+.notice-wide {
+  margin: 0 18px 12px;
+  flex-wrap: wrap;
 }
 
-.chat-head-actions .notice .btn {
-  height: 24px;
-  padding: 0 9px;
+.notice-wide .notice-copy {
+  min-width: 260px;
+}
+
+.notice-wide .btn {
+  height: 26px;
+  padding: 0 10px;
   font-size: 11.5px;
   flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .chat-scroll {

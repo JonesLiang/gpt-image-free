@@ -21,6 +21,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::boot_info,
             commands::backend_health,
+            commands::diagnose_backend,
+            commands::open_data_dir,
             commands::list_accounts,
             commands::refresh_accounts,
             commands::delete_accounts,

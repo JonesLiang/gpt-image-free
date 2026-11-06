@@ -8,6 +8,7 @@ use crate::settings::Settings;
 use crate::updater::{self, ReleaseInfo};
 use serde::Serialize;
 use std::sync::Mutex;
+use std::time::Duration;
 
 pub struct AppState {
     settings: Mutex<Settings>,
@@ -75,6 +76,118 @@ pub async fn backend_health(state: tauri::State<'_, AppState>) -> Result<bool, S
         // 401 等说明服务在跑，只是 key 不对——仍然算在线，让上层报具体错误。
         Err(_) => Ok(true),
     }
+}
+
+/// 离线时的结构化诊断：把「error sending request」拆成能行动的信号。
+/// 关键是用 TCP 直连判断端口有没有人监听（不走系统代理），从而区分
+/// 「后端没启动」和「系统代理把回环请求劫持了」。
+#[derive(Serialize)]
+pub struct BackendDiagnostic {
+    pub base_url: String,
+    pub endpoint: String,
+    pub port_listening: bool,
+    pub port_detail: String,
+    pub data_dir: String,
+    pub data_dir_exists: bool,
+    pub admin_key_path: String,
+    pub admin_key_ready: bool,
+    pub source_dir_exists: bool,
+    pub advice: String,
+}
+
+fn probe_port(endpoint: &str) -> (bool, String) {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(mut addrs) = endpoint.to_socket_addrs() else {
+        return (false, format!("无法解析地址 {endpoint}"));
+    };
+    let Some(addr) = addrs.next() else {
+        return (false, format!("无法解析地址 {endpoint}"));
+    };
+    match TcpStream::connect_timeout(&addr, Duration::from_millis(400)) {
+        Ok(_) => (true, format!("{addr} 有服务监听")),
+        Err(e) => (false, format!("{addr} 无人监听（{e}）")),
+    }
+}
+
+#[tauri::command]
+pub fn diagnose_backend(state: tauri::State<'_, AppState>) -> BackendDiagnostic {
+    let base_url = state
+        .settings
+        .lock()
+        .map(|s| s.base_url.clone())
+        .unwrap_or_else(|_| api::DEFAULT_BASE_URL.to_string());
+    let parsed = url::Url::parse(&base_url).ok();
+    let host = parsed
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .unwrap_or("127.0.0.1")
+        .to_string();
+    let port = parsed
+        .as_ref()
+        .and_then(|u| u.port_or_known_default())
+        .unwrap_or(80);
+    let endpoint = format!("{host}:{port}");
+    let (port_listening, port_detail) = probe_port(&endpoint);
+
+    let dir = api::data_dir();
+    let key_path = dir.join("admin-key");
+    let admin_key_ready = !api::read_admin_key().is_empty();
+    let data_dir_exists = dir.is_dir();
+    let source_dir_exists = dir.join("source").is_dir();
+
+    let advice = if !port_listening {
+        if !data_dir_exists {
+            "数据目录都不存在：这台机器还没有安装/初始化 chatgpt2api-native 后端。请先安装并启动后端；若后端部署在别的机器，请到「插件设置 → 后端连接地址」改成实际地址。"
+        } else if !admin_key_ready {
+            "数据目录存在但缺少 admin-key：后端可能没初始化，或装在别的用户目录。启动后端后会自动生成 admin-key；也可以点「打开数据目录」核对。"
+        } else {
+            "端口无人监听：admin-key 在，但后端服务没有启动。请启动 chatgpt2api-native 后点「重新连接」。"
+        }
+    } else if !admin_key_ready {
+        "端口有服务监听，但本机 admin-key 缺失：请求会以 401 失败。请把该后端的 admin-key 放到数据目录，或确认连的是同一套后端。"
+    } else {
+        "端口和 admin-key 都就绪却仍连不上：多半是系统代理或防火墙拦截请求。可到「插件设置」修改连接地址，并查看后端日志。"
+    }
+    .to_string();
+
+    BackendDiagnostic {
+        base_url,
+        endpoint,
+        port_listening,
+        port_detail,
+        data_dir: dir.to_string_lossy().to_string(),
+        data_dir_exists,
+        admin_key_path: key_path.to_string_lossy().to_string(),
+        admin_key_ready,
+        source_dir_exists,
+        advice,
+    }
+}
+
+/// 在文件管理器中打开后端数据目录，方便核对 admin-key / source 是否存在。
+#[tauri::command]
+pub fn open_data_dir() -> Result<(), String> {
+    let dir = api::data_dir();
+    if !dir.is_dir() {
+        return Err(format!("数据目录不存在：{}", dir.display()));
+    }
+    let path = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("explorer")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[tauri::command]
