@@ -1,9 +1,6 @@
 name: release
 
-# 只做 Windows + macOS。Linux 暂时不出包，原因：
-#   1) 构建环境最重（要装整套 WebKitGTK，apt 一步就 1-2 分钟）
-#   2) 校验最不可靠（linuxdeploy 在部分发行版上失败率偏高）
-# 需要时把 linux job 加回来即可。
+# 只做 Windows + macOS，Linux 暂不出包。
 on:
   push:
     tags:
@@ -13,12 +10,11 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: true
+# 不设 concurrency：取消一个 run 会连带取消同组正在跑的 run，
+# 之前就因此误杀过正在构建的任务。宁可并存也别互相打断。
 
 jobs:
-  # ── 单元测试：独立并行，挂了不阻塞出包 ─────────────────────────
+  # ── 单元测试：macOS 跑，与构建并行，失败不挡出包 ──────────────
   test:
     runs-on: macos-latest
     continue-on-error: true
@@ -27,7 +23,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: src-tauri -> target
           shared-key: test
       - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
@@ -40,7 +36,6 @@ jobs:
           - os: macos-latest
             name: macos-arm64
             target: aarch64-apple-darwin
-            # 只出 dmg，不出 app.tar.gz：安装包本身已压缩，不必再压一遍
             bundles: dmg
           - os: macos-latest
             name: macos-x64
@@ -61,11 +56,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: matrix.target == ''
 
-      # 缓存是快慢的分水岭：首次冷启动约 3 分钟，之后命中缓存约 1 分钟。
-      # shared-key 让 mac 双架构共用同一份依赖缓存。
+      # 缓存是快慢的分水岭：首次约 3 分钟，之后命中缓存约 1 分钟。
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri
+          workspaces: src-tauri -> target
           shared-key: ${{ matrix.name }}
 
       - name: 编译打包
@@ -75,12 +69,16 @@ jobs:
             ${{ matrix.target && format('--target {0}', matrix.target) || '' }} \
             --bundles ${{ matrix.bundles }}
 
+      # 关键：这是 cargo workspace，产物在仓库根的 target/，
+      # 不在 src-tauri/target/。之前写错路径导致编译成功却收集失败。
       - name: 收集产物
         shell: bash
         run: |
           mkdir -p dist
-          find src-tauri/target -type f \( -name '*.dmg' -o -name '*setup.exe' \) -exec cp {} dist/ \;
+          find target -type f \( -name '*.dmg' -o -name '*setup.exe' \) -exec cp {} dist/ \;
+          echo "--- 收集到："
           ls -la dist
+          test -n "$(ls -A dist)" || { echo "没有找到任何安装包，产物路径可能又不对"; exit 1; }
 
       - uses: actions/upload-artifact@v4
         with:
@@ -89,7 +87,7 @@ jobs:
           if-no-files-found: error
           retention-days: 5
 
-  # ── 收齐后一次性发布，不与 build 抢权限 ───────────────────────
+  # ── 收齐后一次性发布 ─────────────────────────────────────────
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -102,7 +100,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
-          name: v${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           body: |
             GPT Image Free ${{ github.ref_name }}
 
