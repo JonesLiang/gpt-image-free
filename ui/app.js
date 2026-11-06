@@ -123,6 +123,8 @@ const state = {
   pendingInject: false,
   // 更新
   updateState: null,
+  // 侧栏折叠
+  sidebarCollapsed: false,
   // DOM 缓存
   dom: null,
   stageRoute: null,
@@ -183,15 +185,6 @@ async function loadAccounts(force) {
 
 /* ------------------------------------------------------------------ 路由 */
 
-const ROUTES = {
-  home: ["◈", "对话"],
-  overview: ["◔", "剩余额度"],
-  pool: ["▤", "号池管理"],
-  api: ["⌘", "API 接入"],
-  import: ["↧", "高级导入"],
-  settings: ["⚙", "设置"],
-};
-
 function setRoute(name) {
   state.route = name;
   closeMenu();
@@ -202,7 +195,7 @@ function setRoute(name) {
 }
 
 function render() {
-  renderRail();
+  renderChrome();
   const stage = $("#stage");
   if (!stage) return;
 
@@ -229,51 +222,126 @@ function render() {
   renderUpdateBar();
 }
 
-function renderRail() {
-  const nav = $("#railNav");
-  if (!nav) return;
-  nav.innerHTML = "";
-  nav.appendChild(
-    el("button", {
-      class: "rail-btn" + (state.route === "home" ? " active" : ""),
-      title: ROUTES.home[1],
-      text: "◈",
-      onclick: () => setRoute("home"),
-    })
+/* ------------------------------------------------------------------ 图标（feather 风格线性 SVG） */
+
+const svgIcon = (paths) =>
+  `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${paths}</svg>`;
+const ICON_EXPAND = svgIcon('<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>');
+const ICON_DOWNLOAD = svgIcon('<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/>');
+const ICON_FOLDER = svgIcon('<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>');
+const ICON_WARN = svgIcon('<path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>');
+const ICON_RETRY = svgIcon('<path d="M23 4v6h-6"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>');
+const ICON_COLLAPSE = svgIcon('<path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/>');
+const ICON_SIDEBAR = svgIcon('<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M15 3v18"/>');
+const ICON_BACK = svgIcon('<path d="M19 12H5"/><path d="M12 19l-7-7 7-7"/>');
+
+/** 无文字的图形按钮：简约、统一 15px 线性图标。 */
+function iconBtn(icon, title, onclick) {
+  return el("button", { class: "icon-btn", title, html: icon, onclick });
+}
+
+/* ------------------------------------------------------------------ 通用 chrome（头像 / 版本号 / 侧栏折叠） */
+
+function avatarButton() {
+  return el(
+    "button",
+    {
+      class: "avatar avatar-btn",
+      title: "账号与设置",
+      onclick: (e) => {
+        e.stopPropagation();
+        $("#avatarMenu").hidden ? openMenu() : closeMenu();
+      },
+    },
+    [el("span", { class: "avatar-letter", text: "L" })]
   );
-  const chip = $("#versionBtn");
-  if (chip) {
-    chip.textContent = "v" + state.version;
-    chip.className = "version-chip" + (state.update && state.update.has_update ? " has-update" : "");
-    chip.title = state.update && state.update.has_update ? `发现新版本 v${state.update.latest}` : "检查更新";
-  }
+}
+
+function versionChip() {
+  return el("button", { class: "version-chip", title: "检查更新", onclick: () => checkUpdate(true) });
+}
+
+/** 更新所有头像字母 / 版本号 / 菜单信息（home 侧栏与设置页共用同一套）。 */
+function renderChrome() {
   const letter = (state.accounts[0] && state.accounts[0].name ? state.accounts[0].name[0] : "L").toUpperCase();
-  $("#avatarLetter").textContent = letter;
-  $("#menuAvatar").textContent = letter;
-  $("#menuName").textContent = "ligang";
-  $("#menuPlan").textContent = state.online === false ? "后端未连接" : "本地客户端";
+  $$(".avatar-letter").forEach((n) => (n.textContent = letter));
+  const menuAvatar = $("#menuAvatar");
+  if (menuAvatar) menuAvatar.textContent = letter;
+  const hasUpdate = !!(state.update && state.update.has_update);
+  $$(".version-chip").forEach((chip) => {
+    chip.textContent = "v" + state.version;
+    chip.classList.toggle("has-update", hasUpdate);
+    chip.title = hasUpdate ? `发现新版本 v${state.update.latest}` : "检查更新";
+  });
+  const plan = $("#menuPlan");
+  if (plan) plan.textContent = state.online === false ? "后端未连接" : "本地客户端";
+}
+
+/** 侧栏折叠状态持久化（不需要后端，localStorage 足够）。 */
+function sidebarCollapsed() {
+  try {
+    return localStorage.getItem("gif:sidebar") === "1";
+  } catch (e) {
+    return false;
+  }
+}
+
+function toggleSidebar() {
+  const next = !state.sidebarCollapsed;
+  state.sidebarCollapsed = next;
+  try {
+    localStorage.setItem("gif:sidebar", next ? "1" : "0");
+  } catch (e) {}
+  const d = state.dom;
+  if (d) {
+    d.sidebar.classList.toggle("collapsed", next);
+    d.expandBtn.hidden = !next;
+  }
+}
+
+/** 非 home 页面顶部的通用条：返回对话 + 版本 + 头像。 */
+function pageChrome() {
+  return el("div", { class: "page-chrome" }, [
+    iconBtn(ICON_BACK, "返回对话", () => setRoute("home")),
+    el("span", { class: "spacer" }),
+    versionChip(),
+    avatarButton(),
+  ]);
 }
 
 /* ------------------------------------------------------------------ 首页骨架 */
 
 function buildHome(stage) {
   const root = el("div", { class: "home" });
+  const collapsed = sidebarCollapsed();
+  state.sidebarCollapsed = collapsed;
 
-  const sidebar = el("aside", { class: "session-sidebar" });
+  const sidebar = el("aside", { class: "session-sidebar" + (collapsed ? " collapsed" : "") });
+  // 侧栏头部：应用图标即「新建对话」，右侧折叠按钮。
   sidebar.appendChild(
     el("div", { class: "sidebar-head" }, [
-      el("button", { class: "new-chat", text: "+ 新建对话", onclick: () => newConversation() }),
-      el("div", { class: "sidebar-label", text: "历史会话" }),
+      el("button", { class: "sidebar-logo", title: "新建对话", "aria-label": "新建对话", onclick: () => newConversation() }),
+      el("span", { class: "spacer" }),
+      iconBtn(ICON_COLLAPSE, "折叠侧栏", toggleSidebar),
     ])
   );
+  sidebar.appendChild(el("div", { class: "sidebar-label", text: "历史会话" }));
   const list = el("div", { class: "session-list" });
   sidebar.appendChild(list);
+  // 侧栏底部：版本号 + 头像（账号 / 设置入口）。
+  sidebar.appendChild(
+    el("div", { class: "sidebar-foot" }, [versionChip(), avatarButton()])
+  );
 
   const main = el("div", { class: "chat-main" });
+  const expandBtn = iconBtn(ICON_SIDEBAR, "展开侧栏", toggleSidebar);
+  expandBtn.className = "icon-btn chat-expand";
+  expandBtn.hidden = !collapsed;
   const title = el("div", { class: "chat-title", text: "图像" });
   const sub = el("div", { class: "chat-sub", text: "描述画面，或上传参考图继续修改" });
   const offline = el("div", { class: "notice", hidden: true });
   const head = el("div", { class: "chat-head" }, [
+    expandBtn,
     el("div", { class: "chat-head-copy" }, [title, sub]),
     el("div", { class: "chat-head-actions" }, [offline]),
   ]);
@@ -296,7 +364,7 @@ function buildHome(stage) {
     state.dom.atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 48;
   });
 
-  state.dom = Object.assign({ root, sidebar, list, head, title, sub, offline, scroll, inner, msgSig: "", listSig: "", atBottom: true }, composer);
+  state.dom = Object.assign({ root, sidebar, list, expandBtn, head, title, sub, offline, scroll, inner, msgSig: "", listSig: "", atBottom: true }, composer);
   autoGrow();
   syncSendBtn();
   return state.dom;
@@ -412,20 +480,29 @@ function renderUserTurn(t) {
 function renderAiTurn(t) {
   const wrap = el("div", { class: "msg-ai" });
   if (t.status === "running") {
+    // ChatGPT 同款：居中细描边旋转圆环 + 一行状态文案，不占多余空间。
     wrap.appendChild(
       el("div", { class: "gen-card" }, [
-        el("div", { class: "skel gen-skel" }),
-        el("div", { class: "gen-row" }, [
-          el("div", { class: "thinking" }, [el("i"), el("i"), el("i")]),
-          el("span", { class: "gen-status", text: "正在理解你的描述…" }),
-        ]),
+        el("div", { class: "gen-spinner" }),
+        el("div", { class: "gen-status", text: "正在生成图像…" }),
       ])
     );
     return wrap;
   }
   if (t.status === "error") {
-    wrap.appendChild(el("div", { class: "msg-error" }, [el("span", { text: "生成失败" }), el("span", { text: t.error || "未知错误" })]));
-    wrap.appendChild(el("button", { class: "btn retry-btn", text: "重新编辑这条提示词", onclick: () => retryTurn(t.id) }));
+    wrap.appendChild(
+      el("div", { class: "msg-error" }, [
+        el("span", { class: "msg-error-icon", html: ICON_WARN }),
+        el("div", { class: "msg-error-body" }, [
+          el("div", { class: "msg-error-title", text: "生成失败" }),
+          el("div", { class: "msg-error-detail", text: t.error || "未知错误" }),
+        ]),
+        el("button", { class: "msg-error-retry", title: "重新编辑这条提示词", onclick: () => retryTurn(t.id) }, [
+          el("span", { class: "msg-error-retry-icon", html: ICON_RETRY }),
+          el("span", { text: "重试" }),
+        ]),
+      ])
+    );
     return wrap;
   }
   if (t.image) {
@@ -434,19 +511,32 @@ function renderAiTurn(t) {
         el("img", { src: t.image, alt: t.prompt }),
       ])
     );
+    // 操作行：图形按钮（放大 / 下载 / 定位文件）+ 右侧元信息，一行搞定。
+    const actions = el("div", { class: "msg-actions" });
+    actions.appendChild(iconBtn(ICON_EXPAND, "放大查看", () => openLightbox(t.image)));
+    actions.appendChild(
+      el("a", { class: "icon-btn", href: t.image, download: `image-${t.id}.png`, title: "下载图片", html: ICON_DOWNLOAD })
+    );
+    if (t.path) {
+      actions.appendChild(
+        iconBtn(ICON_FOLDER, "在文件夹中显示", () => {
+          call("reveal_image", { path: t.path }).catch((e) => toast(String(e && e.message ? e.message : e), true));
+        })
+      );
+    }
+    const bits = [t.account || "本地", clock(t.createdAt)];
+    if (t.injected) bits.push("已注入上下文");
+    if (t.reference) bits.push("自定义参考图");
+    else if (t.refRound) bits.push(`参考第 ${t.refRound} 轮`);
     wrap.appendChild(
-      el("div", { class: "msg-actions" }, [
-        el("button", { class: "btn", text: "放大查看", onclick: () => openLightbox(t.image) }),
-        el("a", { class: "btn", href: t.image, download: `image-${t.id}.png`, text: "下载" }),
+      el("div", { class: "msg-aside" }, [
+        actions,
+        el("span", { class: "spacer" }),
+        el("span", { class: "msg-meta", text: bits.join(" · ") }),
       ])
     );
   }
   if (t.text) wrap.appendChild(el("div", { class: "msg-text", text: t.text }));
-  const bits = [t.account || "本地", clock(t.createdAt)];
-  if (t.injected) bits.push("已注入上下文");
-  if (t.reference) bits.push("自定义参考图");
-  else if (t.refRound) bits.push(`参考第 ${t.refRound} 轮`);
-  wrap.appendChild(el("div", { class: "msg-meta", text: bits.join(" · ") }));
   return wrap;
 }
 
@@ -598,21 +688,16 @@ function retryTurn(id) {
 
 /* ------------------------------------------------------------------ 输入框 */
 
+/** ChatGPT 式输入区：参考图条在卡片内顶部，文本独占中间（自身滚动），
+    + / 账号 / 发送固定在底部工具行——多行输入时空间全部让给文本。 */
 function buildComposer() {
   const wrap = el("div", { class: "composer-wrap" });
-
-  const refChip = el("div", { class: "reference-chip", hidden: true });
   const composer = el("div", { class: "composer" });
 
+  // 参考图预览条：输入框卡片内部第一行，有图才出现。
+  const refChip = el("div", { class: "reference-chip", hidden: true });
   const refInput = el("input", { type: "file", accept: "image/*", style: "display:none" });
   refInput.addEventListener("change", onReferencePicked);
-
-  const plus = el("button", {
-    class: "composer-plus",
-    title: "选择参考图（可基于图片继续修改）",
-    text: "+",
-    onclick: () => refInput.click(),
-  });
 
   const textarea = el("textarea", { placeholder: "描述你想生成的图像…", rows: "1" });
   textarea.value = state.input;
@@ -634,17 +719,29 @@ function buildComposer() {
     }
   });
 
+  // 底部工具行：左边 +，右边账号与发送。
+  const plus = el("button", {
+    class: "composer-plus",
+    title: "选择参考图（可基于图片继续修改）",
+    text: "+",
+    onclick: () => refInput.click(),
+  });
   const pill = el("button", { class: "model-pill", title: "选择账号", onclick: toggleAccountPop });
   const sendBtn = el("button", { class: "composer-send", title: "生成（Enter）", text: "↑", onclick: sendPrompt });
-  const right = el("div", { class: "composer-right" }, [pill, sendBtn]);
-  composer.appendChild(plus);
+  const toolbar = el("div", { class: "composer-toolbar" }, [
+    plus,
+    el("span", { class: "spacer" }),
+    pill,
+    sendBtn,
+  ]);
+
+  composer.appendChild(refChip);
   composer.appendChild(refInput);
   composer.appendChild(textarea);
-  composer.appendChild(right);
+  composer.appendChild(toolbar);
 
   const hint = el("div", { class: "composer-hint", text: "Enter 发送 · Shift+Enter 换行 · + 添加参考图" });
   const popHolder = el("div", { class: "pop-holder" });
-  wrap.appendChild(refChip);
   wrap.appendChild(composer);
   wrap.appendChild(hint);
   wrap.appendChild(popHolder);
@@ -775,7 +872,7 @@ function buildAccountPop() {
     return pop;
   }
   if (list.length === 0) {
-    pop.appendChild(el("div", { class: "pop-title", text: "没有账号，请在头像菜单 → 号池管理中导入" }));
+    pop.appendChild(el("div", { class: "pop-title", text: "没有账号，请在「高级导入」中导入" }));
     return pop;
   }
   const addGroup = (title, items) => {
@@ -983,6 +1080,7 @@ function setZoom(next) {
 
 function renderOverview(stage) {
   const page = el("div", { class: "page" });
+  page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "剩余额度" }));
   page.appendChild(
     el("p", {
@@ -1003,7 +1101,7 @@ function renderOverview(stage) {
   );
   const section = el("div", { class: "section" });
   if (state.accounts.length === 0) {
-    section.appendChild(el("div", { class: "empty", html: "<strong>还没有账号</strong>在「号池管理」中导入账号。" }));
+    section.appendChild(el("div", { class: "empty", html: "<strong>还没有账号</strong>在「高级导入」中批量导入账号。" }));
   } else {
     const table = el("table", { class: "table" });
     table.appendChild(el("tr", {}, [
@@ -1047,6 +1145,7 @@ async function deleteBlocked() {
 
 function renderPool(stage) {
   const page = el("div", { class: "page" });
+  page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "号池管理" }));
   page.appendChild(el("p", { class: "page-sub", text: "查看本机账号池中的所有账号。账号的登录与凭据刷新由后端负责。" }));
   const section = el("div", { class: "section" });
@@ -1077,6 +1176,7 @@ function renderPool(stage) {
 
 function renderApi(stage) {
   const page = el("div", { class: "page" });
+  page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "API 接入" }));
   page.appendChild(el("p", { class: "page-sub", text: "本机后端提供 OpenAI 兼容接口，可直接用于第三方客户端。" }));
   const base = state.baseUrl || "http://127.0.0.1:38650";
@@ -1100,6 +1200,7 @@ function copy(text) {
 
 function renderImport(stage) {
   const page = el("div", { class: "page" });
+  page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "高级导入" }));
   page.appendChild(el("p", { class: "page-sub", text: "批量导入账号。每行一个，格式为「邮箱密码凭据」，由后端解析。" }));
   const section = el("div", { class: "section" });
@@ -1113,6 +1214,7 @@ function renderImport(stage) {
 
 function renderSettings(stage) {
   const page = el("div", { class: "page" });
+  page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "插件设置" }));
   page.appendChild(el("p", { class: "page-sub", text: "设置会立即保存到本地配置。" }));
   const section = el("div", { class: "section" });
@@ -1211,7 +1313,7 @@ async function checkUpdate(manual) {
   try {
     const info = await call("check_update");
     state.update = info;
-    renderRail();
+    renderChrome();
     if (info.has_update) {
       state.updateState = { stage: "found", info };
       renderUpdateBar();
@@ -1260,20 +1362,12 @@ async function startAutoUpdate() {
 
 function openMenu() {
   $("#avatarMenu").hidden = false;
-  $("#avatarBtn").setAttribute("aria-expanded", "true");
 }
 function closeMenu() {
   $("#avatarMenu").hidden = true;
-  $("#avatarBtn").setAttribute("aria-expanded", "false");
 }
 
 function bindChrome() {
-  $("#avatarBtn").addEventListener("click", (e) => {
-    e.stopPropagation();
-    $("#avatarMenu").hidden ? openMenu() : closeMenu();
-  });
-  $("#logoBtn").addEventListener("click", () => newConversation());
-  $("#versionBtn").addEventListener("click", () => checkUpdate(true));
   $$("#avatarMenu .menu-item").forEach((b) => b.addEventListener("click", () => setRoute(b.dataset.route)));
 
   const box = $("#lightbox");
@@ -1311,7 +1405,7 @@ function bindChrome() {
     }
   });
   document.addEventListener("click", (e) => {
-    if (!$("#avatarMenu").hidden && !e.target.closest("#avatarMenu,#avatarBtn")) closeMenu();
+    if (!$("#avatarMenu").hidden && !e.target.closest("#avatarMenu,.avatar-btn")) closeMenu();
   });
   tickTimer = setInterval(() => render(), 30000);
 }

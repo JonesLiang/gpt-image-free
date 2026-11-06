@@ -116,8 +116,8 @@ impl Client {
     pub fn new(base_url: Option<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(360))
-            // 本机后端不走系统代理：用户可能开着全局代理，回环地址必须直连。
-            .no_proxy()
+            // 不强制直连：是否走代理交给用户本地环境（系统代理 / 环境变量），
+            // 客户端不与代理设置深度绑定。
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {

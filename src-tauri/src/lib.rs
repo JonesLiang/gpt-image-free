@@ -35,6 +35,7 @@ pub fn run() {
             commands::install_update,
             commands::restart_app,
             commands::reveal_images,
+            commands::reveal_image,
         ])
         .run(tauri::generate_context!())
         .expect("启动 GPT Image Free 失败");

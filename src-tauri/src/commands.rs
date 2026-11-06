@@ -254,3 +254,51 @@ pub fn reveal_images() -> Result<(), String> {
     }
     Ok(())
 }
+
+/// 在系统的文件管理器中定位并选中某一张已生成的图片。
+///
+/// macOS 用 `open -R`（reveal），Windows 用 `explorer /select,`。
+/// 只允许打开图片目录内的文件，避免把命令当任意路径跳板。
+#[tauri::command]
+pub fn reveal_image(path: String) -> Result<(), String> {
+    let base = crate::storage::images_dir();
+    let base = base
+        .canonicalize()
+        .or_else(|_| std::fs::create_dir_all(&base).and_then(|_| base.canonicalize()))
+        .map_err(|e| format!("图片目录不可用：{e}"))?;
+    let target = std::path::PathBuf::from(&path);
+    let target = target
+        .canonicalize()
+        .map_err(|e| format!("文件不存在：{e}"))?;
+    if !target.starts_with(&base) {
+        return Err("只能定位图片保存目录内的文件".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(&target)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target.to_string_lossy()))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Linux 文件管理器没有统一的“定位单个文件”协议，退化为打开所在目录。
+        let dir = target
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(target.clone());
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}

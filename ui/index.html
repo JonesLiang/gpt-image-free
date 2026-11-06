@@ -8,21 +8,7 @@
   </head>
   <body>
     <div id="app">
-      <!-- 左侧窄栏：只放导航图标，最底部是头像 -->
-      <aside class="rail">
-        <div class="rail-top">
-          <button class="rail-logo" id="logoBtn" title="新建对话" aria-label="新建对话"></button>
-          <nav class="rail-nav" id="railNav" aria-label="导航"></nav>
-        </div>
-        <div class="rail-bottom">
-          <button class="version-chip" id="versionBtn" title="检查更新"></button>
-          <button class="avatar" id="avatarBtn" aria-haspopup="menu" aria-expanded="false">
-            <span id="avatarLetter">L</span>
-          </button>
-        </div>
-      </aside>
-
-      <!-- 头像菜单 -->
+      <!-- 头像 / 设置菜单：从会话侧栏底部（或设置页右上角）的头像弹出 -->
       <div class="menu" id="avatarMenu" role="menu" hidden>
         <div class="menu-head">
           <div class="menu-avatar" id="menuAvatar">L</div>
@@ -34,9 +20,6 @@
         <div class="menu-sep"></div>
         <button class="menu-item" data-route="overview" role="menuitem">
           <span class="mi-icon"></span><span>剩余额度</span>
-        </button>
-        <button class="menu-item" data-route="pool" role="menuitem">
-          <span class="mi-icon"></span><span>号池管理</span>
         </button>
         <button class="menu-item" data-route="api" role="menuitem">
           <span class="mi-icon"></span><span>API 接入</span>
