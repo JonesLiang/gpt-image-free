@@ -18,8 +18,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # 单元测试和打包并行跑，不再串行等待。
+  # 单元测试和打包并行跑，互不阻塞。
   # 测试只编译 std + 几个纯逻辑 crate，用不着 WebKit，所以不放 Linux 上。
+  # 注意：build 不 needs test——测挂了靠 CI 红灯提醒，不拖慢发版。
   test:
     runs-on: macos-latest
     steps:

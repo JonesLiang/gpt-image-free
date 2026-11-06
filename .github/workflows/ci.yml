@@ -1,0 +1,49 @@
+name: ci
+
+# 每次推送到 main 都跑一遍构建（不发布），把 rust-cache 暖起来，
+# 这样打 tag 发版时能直接命中增量缓存，而不是从零编译 Tauri 那几百个 crate。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            name: macos
+            args: --target aarch64-apple-darwin
+          - platform: ubuntu-22.04
+            name: linux-x64
+            args: ""
+          - platform: windows-latest
+            name: windows-x64
+            args: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux 系统依赖
+        if: matrix.name == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libgtk-3-dev
+      - uses: dtolnay/rust-toolchain@stable
+      # 和 release.yml 用同一个 shared-key，两边共用缓存
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          shared-key: ${{ matrix.name }}
+      - name: 编译检查
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml ${{ matrix.args }}
