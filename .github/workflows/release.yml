@@ -1,7 +1,8 @@
 name: release
 
-# 推送形如 v0.1.0 的 tag 时触发多平台构建并发布 Release。
-# 客户端通过 api.github.com 查最新 release，走 gh-proxy 镜像下载安装包。
+# 推动形如 v0.1.0 的 tag 时触发多平台构建并发布 Release。
+# 客户端通过 github.com/.../releases/latest 的跳转查最新版本（不占 API 配额），
+# 走 gh-proxy 镜像下载安装包。
 on:
   push:
     tags:
@@ -11,66 +12,66 @@ on:
 permissions:
   contents: write
 
+# 同一 tag 重复触发时，取消上一次，避免两个构建抢着往同一个 Release 传文件。
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
-  # 先在 Ubuntu 上跑单元测试，失败就不打包
+  # 单元测试和打包并行跑，不再串行等待。
+  # 测试只编译 std + 几个纯逻辑 crate，用不着 WebKit，所以不放 Linux 上。
   test:
-    runs-on: ubuntu-22.04
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: 系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libgtk-3-dev
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          shared-key: test
+          # 测试只用 debug 产物，缓存 debug 就够了。
+          cache-all-crates: true
       - name: 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
   build:
-    needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
+          # 两个 macOS 目标合成一个 job：同一台 runner 编译两次，
+          # 省掉一台机器的排队和 checkout，公共依赖只编一遍也可复用。
           - platform: macos-latest
-            args: --target aarch64-apple-darwin
-            name: macos-arm64
-          - platform: macos-latest
-            args: --target x86_64-apple-darwin
-            name: macos-x64
+            name: macos
+            args: --target aarch64-apple-darwin --target x86_64-apple-darwin
           - platform: ubuntu-22.04
-            args: ""
             name: linux-x64
-          - platform: windows-latest
             args: ""
+          - platform: windows-latest
             name: windows-x64
+            args: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Linux 系统依赖
-        if: matrix.platform == 'ubuntu-22.04'
+        if: matrix.name == 'linux-x64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
-            librsvg2-dev patchelf libgtk-3-dev
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libgtk-3-dev
 
-      # Intel Mac 需要额外装 x86_64 目标；其它平台用默认目标即可
       - uses: dtolnay/rust-toolchain@stable
-        if: matrix.name == 'macos-x64'
         with:
-          targets: x86_64-apple-darwin
-      - uses: dtolnay/rust-toolchain@stable
-        if: matrix.name != 'macos-x64'
+          # macOS 需要同时能编 arm64 和 x64
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
 
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: ${{ matrix.name }}
+          shared-key: ${{ matrix.name }}
 
       - name: 构建并上传
         uses: tauri-apps/tauri-action@v0
@@ -84,23 +85,26 @@ jobs:
             GPT Image Free ${{ github.ref_name }}
 
             - macOS：*_aarch64.dmg（Apple 芯片）/ *_x64.dmg（Intel）
-            - Windows：*_x64_zh-CN.msi
-            - Linux：*_amd64.AppImage
+            - Windows：*_x64-setup.exe（推荐）/ *_x64_en-US.msi
+            - Linux：*_amd64.AppImage / *.deb
 
             国内下载慢可把链接前缀替换为 https://gh-proxy.com/
           releaseDraft: false
           prerelease: false
+          # 安装包本身已经是压缩格式（dmg / AppImage / nsis / msi），
+          # tauri 默认还会再压一遍 tar.gz 并算 SHA，对一个 4MB 的壳子纯属浪费。
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
 
-  # 所有平台都构建完成后，把版本号写回 Cargo.toml，方便下次发版跟随
+  # 构建完成后再确认产物齐全，避免发一个空 Release。
   verify:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
       - name: 确认产物
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release view "${{ github.ref_name }}" --json assets \
-            --jq '.assets[].name'
+          gh release view "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --json assets --jq '.assets[].name'
