@@ -1,10 +1,11 @@
 name: ci
 
-# 每次推送到 main 都跑一遍构建（不发布），把 rust-cache 暖起来，
-# 这样打 tag 发版时能直接命中增量缓存，而不是从零编译 Tauri 那几百个 crate。
+# 手动触发的一次性构建（不打包、不发布），用途只有两个：
+#   1. 把 rust-cache 暖起来，之后发版能命中增量缓存；
+#   2. 发版前先确认三个平台都编得过。
 on:
-  push:
-    branches: [main]
+  # 只手动触发：平时推 main 不会额外跑一遍三平台构建。
+  # 准备发版前，在 Actions 页面点一次 Run workflow 把缓存暖起来即可。
   workflow_dispatch:
 
 permissions:
