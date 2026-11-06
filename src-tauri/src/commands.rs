@@ -136,6 +136,63 @@ pub async fn oauth_finish(
     c.oauth_finish(&session_id, &callback).await.map_err(err)
 }
 
+/// 批量凭据一键授权入池：worker 完成 OAuth + TOTP 换 token，成功后统一写号池。
+/// 失败的账号原样返回，前端据此把原始行回填到输入框方便改完重试。
+#[tauri::command]
+pub async fn authorize_credentials(
+    state: tauri::State<'_, AppState>,
+    credentials: Vec<crate::auth::Credential>,
+    proxy: Option<String>,
+) -> Result<serde_json::Value, String> {
+    use std::collections::HashMap;
+
+    let total = credentials.len();
+    // 拥有值而不是借用，这样 credentials 可以直接 move 给 worker，
+    // 后面仍能按邮箱找回原始密码 / 2FA 写进号池。
+    let mut by_email: HashMap<String, (String, String, String)> = HashMap::new();
+    for c in &credentials {
+        by_email.insert(
+            c.email.to_lowercase(),
+            (c.email.clone(), c.password.clone(), c.totp_secret.clone()),
+        );
+    }
+
+    let output = crate::auth::authorize(credentials, proxy).await?;
+    let mut payloads = Vec::new();
+    for r in &output.results {
+        if !r.ok || r.access_token.is_empty() {
+            continue;
+        }
+        let key = r.email.to_lowercase();
+        let cred = by_email.get(&key).cloned().unwrap_or_else(|| (r.email.clone(), String::new(), String::new()));
+        payloads.push(serde_json::json!({
+            "email": cred.0,
+            "password": cred.1,
+            "totp_secret": cred.2,
+            "access_token": r.access_token,
+            "refresh_token": r.refresh_token,
+            "id_token": r.id_token,
+            "source_type": "oauth_password_2fa",
+            "type": "oauth",
+        }));
+    }
+    let succeeded = payloads.len();
+    let enrolled = if payloads.is_empty() {
+        serde_json::json!({ "added": 0, "skipped": 0, "errors": [] })
+    } else {
+        let c = client(&state);
+        c.add_accounts(payloads).await.map_err(err)?
+    };
+
+    Ok(serde_json::json!({
+        "total": total,
+        "succeeded": succeeded,
+        "failed": total.saturating_sub(succeeded),
+        "enrolled": enrolled,
+        "results": output.results,
+    }))
+}
+
 /// 执行一轮生图。
 ///
 /// `reference` 是上一张图的 base64；给了就基于它改图，没给就纯文生图。

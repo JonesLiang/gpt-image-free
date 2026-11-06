@@ -1120,10 +1120,16 @@ a.icon-btn {
   margin-bottom: 16px;
 }
 
-/* 离线诊断横幅：主文案 + 一行可排查的连接细节 */
+/* 离线诊断横幅：主文案 + 可排查的连接细节 + 操作按钮 */
 .notice-copy {
   flex: 1;
   min-width: 0;
+}
+
+.notice-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
 }
 
 .notice-title {
@@ -1928,6 +1934,56 @@ a.icon-btn {
   font-size: 11.5px;
   line-height: 1.65;
   color: var(--text-faint);
+}
+
+/* 批量导入：解析统计、TXT 文件、代理输入与备用手动授权 */
+.imp-stats {
+  margin-top: 12px;
+  padding: 9px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.imp-stats.warn {
+  border-color: rgba(216, 166, 87, 0.45);
+}
+
+.imp-file {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.imp-file::file-selector-button {
+  margin-right: 10px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.imp-proxy {
+  width: 100%;
+  margin-top: 10px;
+  font-size: 11.5px;
+}
+
+.imp-manual-toggle {
+  margin-top: 16px;
+}
+
+.imp-result .btn {
+  margin-top: 10px;
+}
+
+.imp-result-errors + .btn {
+  margin-top: 10px;
 }
 
 /* 窄窗口：会话列表收窄，避免挤压消息区 */

@@ -4,6 +4,8 @@ target/
 node_modules/
 ui/dist/
 *.log
+__pycache__/
+*.py[cod]
 
 # 本地配置
 .env

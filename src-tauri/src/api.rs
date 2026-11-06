@@ -46,6 +46,14 @@ pub fn data_dir() -> PathBuf {
             return PathBuf::from(dir);
         }
     }
+    // Windows 上优先 USERPROFILE：Git Bash / MSYS 之类会注入 HOME，且未必指向
+    // 真正的用户目录。若先读 HOME，就会去一个不存在的位置找 admin-key，
+    // 表现为「后端明明在跑，客户端却一直报 401 / 未找到 admin-key」。
+    #[cfg(target_os = "windows")]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    #[cfg(not(target_os = "windows"))]
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_default();

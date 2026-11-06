@@ -5,6 +5,7 @@
 
 pub mod accounts;
 pub mod api;
+pub mod auth;
 pub mod chat;
 pub mod commands;
 pub mod conversations;
@@ -26,6 +27,7 @@ pub fn run() {
             commands::import_accounts,
             commands::oauth_start,
             commands::oauth_finish,
+            commands::authorize_credentials,
             commands::generate,
             commands::save_settings,
             commands::check_update,

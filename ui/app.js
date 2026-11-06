@@ -166,9 +166,10 @@ function pickBestAccount() {
   return sortedAccounts().find((a) => a.usable) || null;
 }
 
-async function loadAccounts(force) {
+async function loadAccounts(force, silent) {
   state.loadingAccounts = true;
-  render();
+  // silent：导入页提交后只刷数据，不重建整页（会打断 textarea 的输入焦点）。
+  if (!silent) render();
   try {
     state.accounts = await call(force ? "refresh_accounts" : "list_accounts");
     state.online = true;
@@ -187,7 +188,7 @@ async function loadAccounts(force) {
     }
   } finally {
     state.loadingAccounts = false;
-    render();
+    if (!silent) render();
   }
 }
 
@@ -875,6 +876,9 @@ function updateComposer() {
       : auth
         ? "后端在线，但 admin-key 校验失败。账号列表为空不是「没有账号」。"
         : "后端已连通，但账号信息读取失败。";
+    // 把「正在查找的完整路径」写出来：只说「检查后端数据目录」用户根本
+    // 无从下手，Windows 上后端装到别处时也能一眼看出该改哪个环境变量。
+    const keyPath = `${state.dataDir || "(未知数据目录)"}/admin-key`;
     d.offline.appendChild(
       el("div", { class: "notice-copy" }, [
         el("div", { class: "notice-title", text: title }),
@@ -882,13 +886,32 @@ function updateComposer() {
           class: "notice-detail",
           text: [
             `连接地址 ${state.baseUrl || "http://127.0.0.1:38650"}`,
-            state.adminKeyReady ? "admin-key 已找到" : "未找到 admin-key（检查后端数据目录）",
-            state.onlineError || "连接被拒绝",
+            state.adminKeyReady ? "admin-key 已找到" : `admin-key 未找到：${keyPath}`,
           ].join(" · "),
+        }),
+        el("div", { class: "notice-detail", text: `底层错误：${state.onlineError || "连接被拒绝"}` }),
+      ])
+    );
+    d.offline.appendChild(
+      el("div", { class: "notice-actions" }, [
+        el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) }),
+        el("button", {
+          class: "btn",
+          text: "复制诊断",
+          onclick: () => {
+            const diag = [
+              `GPT Image Free v${state.version}`,
+              `连接地址：${state.baseUrl || "http://127.0.0.1:38650"}`,
+              `数据目录：${state.dataDir || "未知"}`,
+              `admin-key：${state.adminKeyReady ? "已找到" : `未找到（${keyPath}）`}`,
+              `底层错误：${state.onlineError || "连接被拒绝"}`,
+              `平台：${navigator.userAgent}`,
+            ].join("\n");
+            copy(diag);
+          },
         }),
       ])
     );
-    d.offline.appendChild(el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) }));
   }
 
   // 账号弹层只在状态/账号数据变化时重建，避免定时 render 打断滚动和点击。
@@ -1292,8 +1315,31 @@ function renderApi(stage) {
   stage.appendChild(page);
 }
 
-function copy(text) {
-  navigator.clipboard.writeText(text).then(() => toast("已复制"), () => toast("复制失败", true));
+/** WebView（尤其 Windows）里 clipboard API 常被权限拦住，保留 execCommand 兜底。 */
+async function copy(text) {
+  const legacy = () => {
+    const tmp = document.createElement("textarea");
+    tmp.value = String(text || "");
+    tmp.setAttribute("readonly", "readonly");
+    tmp.style.position = "fixed";
+    tmp.style.top = "-1000px";
+    tmp.style.opacity = "0";
+    document.body.appendChild(tmp);
+    tmp.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (e) {}
+    tmp.remove();
+    return ok;
+  };
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(String(text || ""));
+      toast("已复制");
+      return;
+    }
+  } catch (e) {}
+  if (legacy()) toast("已复制");
+  else toast("复制失败，请手动选中内容", true);
 }
 
 /* ------------------------------------------------------------------ 导入 */
@@ -1303,8 +1349,11 @@ function copy(text) {
 const imp = {
   text: "",
   rows: null,
+  parse: null,
   result: null,
   busy: false,
+  proxy: "",
+  showManual: false,
   oauth: null,
   callback: "",
   oauthBusy: false,
@@ -1324,91 +1373,178 @@ function shortToken(s) {
   return v.length > 18 ? v.slice(0, 10) + "…" + v.slice(-6) : v;
 }
 
-/** 每行优先按 ---- 切；密码里常带符号，所以绝不按任意标点乱切。 */
+/* 解析规则对齐 chatgpt2api 号池管理的「邮箱 / 密码 / 第三字段」批量导入。 */
+const IMPORT_MAX_BYTES = 1024 * 1024;
+const IMPORT_MAX_LINES = 1000;
+
+/** 优先按 ---- 切，其次 ---，最后才是任意 3+ 连字符。
+    密码里常带连字符和标点，一上来就用 /-{3,}/ 全切会把密码切断。 */
 function splitCredential(line) {
-  if (/-{3,}/.test(line)) return line.split(/-{3,}/).map((s) => s.trim());
-  if (line.includes("\t")) return line.split(/\t+/).map((s) => s.trim());
-  if (line.includes("|")) return line.split("|").map((s) => s.trim());
-  const byColon = line.split(":");
-  if (byColon.length === 3 && EMAIL_RE.test(byColon[0].trim())) {
-    return byColon.map((s) => s.trim());
+  let parts = line.split("----");
+  if (parts.length < 3) {
+    const p3 = line.split("---");
+    if (p3.length >= 3) parts = p3;
+    else {
+      const pn = line.split(/-{3,}/);
+      if (pn.length >= 3) parts = pn;
+    }
   }
-  return [line.trim()];
+  return parts;
+}
+
+/** 只解 JWT payload 看 exp，不验签：用于判断这行自带的 token 是否还有效。 */
+function jwtExpiresAt(token) {
+  try {
+    const p = String(token).split(".");
+    if (p.length !== 3) return 0;
+    const b64 = p[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    return Number(JSON.parse(atob(padded)).exp || 0) * 1000;
+  } catch (e) {
+    return 0;
+  }
+}
+
+/** 三字段必填，可选第 4 字段 access_token、第 5 字段 refresh_token。
+    密码保留原样（不做 trim），邮箱统一小写。 */
+function credentialFromParts(parts) {
+  if (parts.length < 3) return { error: "应为 邮箱----密码----第三字段（至少三个字段）" };
+  const email = String(parts[0]).trim().toLowerCase();
+  const password = String(parts[1]);
+  const aux = String(parts[2]).trim();
+  const token = parts.length > 3 ? String(parts[3]).trim() : "";
+  const refresh = parts.length > 4 ? String(parts[4]).trim() : "";
+  if (email.length > 254 || !EMAIL_RE.test(email)) return { error: "邮箱格式不正确" };
+  if (!password.length || password.length > 512 || /[\r\n\0]/.test(password)) return { error: "密码为空或长度超限" };
+  if (!aux.length || aux.length > 512 || /[\r\n\0]/.test(aux)) return { error: "第三字段为空或长度超限" };
+  if (token && (token.length > 8192 || /[\r\n\0]/.test(token))) return { error: "Token 格式不正确或长度超限" };
+  if (refresh && (refresh.length > 8192 || /[\r\n\0]/.test(refresh))) return { error: "RefreshToken 格式不正确或长度超限" };
+  return { account: { email, password, auxiliary: aux, accessToken: token, refreshToken: refresh } };
+}
+
+/** 自带未过期 token 的行可直接入池；否则记为待 OAuth 授权的凭据行。 */
+function rowFromAccount(a) {
+  const cred = {
+    kind: "credential",
+    email: a.email,
+    password: a.password,
+    totp: a.auxiliary || "",
+    accessToken: a.accessToken || "",
+    refreshToken: a.refreshToken || "",
+  };
+  if (a.accessToken && jwtExpiresAt(a.accessToken) > Date.now() + 60000) {
+    return {
+      kind: "token",
+      payload: {
+        email: a.email,
+        password: a.password,
+        totp_secret: a.auxiliary || "",
+        access_token: a.accessToken,
+        refresh_token: a.refreshToken || "",
+        source_type: "oauth_password_2fa",
+        type: "oauth",
+      },
+      credential: cred,
+    };
+  }
+  return cred;
 }
 
 function accountFromObject(obj) {
   const o = obj && typeof obj === "object" ? obj : {};
   const token = String(o.access_token || o.accessToken || "").trim();
-  const email = String(o.email || "").trim();
+  const email = String(o.email || "").trim().toLowerCase();
   const password = String(o.password || "").trim();
-  const totp = String(o.totp_secret || o.totpSecret || o.otp_secret || o["2fa"] || "").trim();
+  const totp = String(o.totp_secret || o.totpSecret || o.otp_secret || o.auxiliary || o["2fa"] || "").trim();
+  const refresh = String(o.refresh_token || o.refreshToken || "").trim();
   if (token) {
     const payload = Object.assign({}, o, { access_token: token });
     delete payload.accessToken;
     return { kind: "token", payload };
   }
   if (EMAIL_RE.test(email) && password) {
-    return { kind: "credential", email, password, totp };
+    return rowFromAccount({ email, password, auxiliary: totp, refreshToken: refresh });
   }
   return null;
 }
 
-/** 支持三种输入：email----password----2FA、裸 access_token、完整账号 JSON。 */
+function pushInvalid(out, line, raw, reason) {
+  out.rows.push({ kind: "invalid", line, raw: shortToken(raw), reason });
+  out.errors.push({ line, reason });
+}
+
+function pushEntry(out, entry, line, raw) {
+  if (!entry) {
+    pushInvalid(out, line, raw, "缺少 access_token 或 邮箱+密码");
+    return;
+  }
+  entry.line = line;
+  entry.label = entry.kind === "token" ? shortToken(entry.payload.access_token) : entry.email;
+  entry.raw = raw;
+  const key = entry.kind === "token" ? entry.payload.access_token : entry.email.toLowerCase();
+  if (out.seen.has(key)) {
+    out.duplicates++;
+    entry.duplicate = true;
+  } else {
+    out.seen.add(key);
+  }
+  out.rows.push(entry);
+}
+
+/** 返回 { rows, errors, duplicates, truncated }；rows 中每行保留 raw 便于失败回填。 */
 function parseImportText(text) {
-  const rows = [];
-  const trimmed = String(text || "").trim();
+  const raw = String(text || "").replace(/^\uFEFF/, "");
+  const out = { rows: [], errors: [], duplicates: 0, truncated: false, seen: new Set() };
+  const bytes = typeof TextEncoder !== "undefined" ? new TextEncoder().encode(raw).length : raw.length;
+  if (bytes > IMPORT_MAX_BYTES) {
+    pushInvalid(out, 0, "整段文本", "文本超过 1 MB，请分批导入");
+    return out;
+  }
+  const trimmed = raw.trim();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
     try {
       const data = JSON.parse(trimmed);
-      (Array.isArray(data) ? data : [data]).forEach((o, i) => {
-        const entry = accountFromObject(o);
-        rows.push(entry
-          ? Object.assign(entry, { line: i + 1, label: entry.kind === "token" ? shortToken(entry.payload.access_token) : entry.email })
-          : { kind: "invalid", line: i + 1, raw: "JSON 对象", reason: "缺少 access_token 或 邮箱+密码" });
-      });
-      return dedupeImportRows(rows);
+      const arr = Array.isArray(data)
+        ? data
+        : Array.isArray(data.accounts) ? data.accounts : [data];
+      arr.forEach((o, i) => pushEntry(out, accountFromObject(o), i + 1, "JSON 对象"));
+      return out;
     } catch (e) {
-      // 多行 JSON 粘贴时可能有换行，落到逐行解析兜底。
+      // 多行 JSON 粘贴时可能只是换行，落到逐行解析兜底。
     }
   }
-  String(text || "").split(/\r?\n/).forEach((line, idx) => {
-    const raw = line.trim();
-    if (!raw || raw.startsWith("#")) return;
+  const lines = raw.split(/\r?\n/);
+  if (lines.length > IMPORT_MAX_LINES) {
+    lines.length = IMPORT_MAX_LINES;
+    out.truncated = true;
+  }
+  lines.forEach((line, idx) => {
+    const lineNo = idx + 1;
+    const v = line.trim();
+    if (!v || v.startsWith("#") || v.startsWith("===")) return;
     let entry = null;
-    if (raw.startsWith("{")) {
-      try { entry = accountFromObject(JSON.parse(raw)); } catch (e) {}
+    if (v.startsWith("{")) {
+      try { entry = accountFromObject(JSON.parse(v)); } catch (e) {}
       if (!entry) {
-        rows.push({ kind: "invalid", line: idx + 1, raw: shortToken(raw), reason: "JSON 解析失败或字段不足" });
+        pushInvalid(out, lineNo, v, "JSON 解析失败或字段不足");
         return;
       }
-    } else if (JWTISH_RE.test(raw) || /^eyJ/.test(raw)) {
-      entry = { kind: "token", payload: { access_token: raw } };
+    } else if (JWTISH_RE.test(v)) {
+      entry = { kind: "token", payload: { access_token: v } };
     } else {
-      const parts = splitCredential(raw);
-      if (parts.length >= 2 && EMAIL_RE.test(parts[0])) {
-        entry = { kind: "credential", email: parts[0], password: parts[1], totp: parts[2] || "" };
+      const parts = /-{3,}/.test(v)
+        ? splitCredential(v)
+        : v.includes("\t") ? v.split(/\t+/) : v.split("|");
+      const parsed = credentialFromParts(parts);
+      if (parsed.error) {
+        pushInvalid(out, lineNo, v, parsed.error);
+        return;
       }
+      entry = rowFromAccount(parsed.account);
     }
-    if (!entry) {
-      rows.push({ kind: "invalid", line: idx + 1, raw: shortToken(raw), reason: "无法识别格式" });
-      return;
-    }
-    entry.line = idx + 1;
-    entry.label = entry.kind === "token" ? shortToken(entry.payload.access_token) : entry.email;
-    rows.push(entry);
+    pushEntry(out, entry, lineNo, v);
   });
-  return dedupeImportRows(rows);
-}
-
-function dedupeImportRows(rows) {
-  const seen = new Set();
-  return rows.map((r) => {
-    if (r.kind === "invalid") return r;
-    const key = r.kind === "token" ? r.payload.access_token : r.email.toLowerCase();
-    if (seen.has(key)) return Object.assign({}, r, { duplicate: true });
-    seen.add(key);
-    return r;
-  });
+  return out;
 }
 
 function importableRows() {
@@ -1419,30 +1555,51 @@ function pendingCredentials() {
   return (imp.rows || []).filter((r) => r.kind === "credential" && !r.duplicate && !r.authorized);
 }
 
-function importSummary(result) {
-  const added = Number(result && result.added) || 0;
-  const skipped = Number(result && result.skipped) || 0;
-  const errors = Array.isArray(result && result.errors) ? result.errors : [];
-  const box = el("div", { class: "imp-result" });
-  box.appendChild(el("div", { class: "imp-result-title", text: `入池完成：新增 ${added} 个，跳过 ${skipped} 个` }));
-  if (errors.length) {
-    box.appendChild(el("div", { class: "imp-result-errors", text: errors.slice(0, 5).map((x) => JSON.stringify(x)).join(" · ") }));
+/** 把失败/未处理的凭据行拼回输入框，方便改完直接重试。 */
+function rowsToText(rows) {
+  return rows.map((r) => {
+    if (r.raw && r.kind !== "invalid") return r.raw;
+    if (r.kind === "credential") {
+      return [r.email, r.password, r.totp, r.accessToken, r.refreshToken]
+        .filter((x) => x !== "" && x !== undefined && x !== null)
+        .join("----");
+    }
+    return String(r.raw || "");
+  }).filter(Boolean).join("\n");
+}
+
+function renderImportStats(host) {
+  host.innerHTML = "";
+  const rows = imp.rows || [];
+  const p = imp.parse || {};
+  if (!rows.length && !String(imp.text || "").trim()) return;
+  const tokens = importableRows().length;
+  const creds = pendingCredentials().length;
+  const bad = rows.filter((r) => r.kind === "invalid").length;
+  const parts = [`共 ${rows.length} 行`];
+  if (tokens) parts.push(`可直接入池 ${tokens}`);
+  if (creds) parts.push(`待授权 ${creds}`);
+  if (bad) parts.push(`格式错误 ${bad}`);
+  if (p.duplicates) parts.push(`重复跳过 ${p.duplicates}`);
+  if (p.truncated) parts.push("仅处理前 1000 行");
+  host.appendChild(el("div", { class: "imp-stats" + (bad ? " warn" : ""), text: parts.join(" · ") }));
+  if (bad && Array.isArray(p.errors)) {
+    const list = p.errors.slice(0, 5).map((x) => x.line ? `第 ${x.line} 行：${x.reason}` : x.reason);
+    if (list.length) host.appendChild(el("div", { class: "imp-result-errors", text: list.join(" · ") }));
   }
-  return box;
 }
 
 function renderImportRows(host) {
   host.innerHTML = "";
   const rows = imp.rows || [];
   if (!rows.length) {
-    host.appendChild(el("div", { class: "imp-empty", text: "粘贴内容后点「解析并预览」。" }));
+    host.appendChild(el("div", { class: "imp-empty", text: "粘贴内容后点「解析并预览」，或直接点「导入并授权入池」。" }));
     return;
   }
-  const head = el("div", { class: "imp-row imp-head" }, [
+  host.appendChild(el("div", { class: "imp-row imp-head" }, [
     el("span", { text: "#" }), el("span", { text: "类型" }), el("span", { text: "标识" }),
     el("span", { text: "2FA" }), el("span", { text: "状态" }),
-  ]);
-  host.appendChild(head);
+  ]));
   rows.slice(0, 60).forEach((r) => {
     const kind = r.kind === "token" ? "Token" : r.kind === "credential" ? "邮箱密码" : "无效";
     const totp = r.kind === "credential"
@@ -1453,7 +1610,7 @@ function renderImportRows(host) {
       : r.authorized ? "已授权入池"
       : r.duplicate ? "重复，已跳过"
       : r.kind === "token" ? "可直接入池"
-      : "需 OAuth 授权";
+      : "待自动授权";
     host.appendChild(el("div", { class: "imp-row" + (r.kind === "invalid" ? " bad" : "") }, [
       el("span", { class: "imp-num", text: String(r.line) }),
       el("span", { class: "imp-kind", text: kind }),
@@ -1467,18 +1624,70 @@ function renderImportRows(host) {
   }
 }
 
+function renderImportResult(host) {
+  host.innerHTML = "";
+  const r = imp.result;
+  if (!r) return;
+  const box = el("div", { class: "imp-result" });
+  const token = r.tokenResult || {};
+  const auth = r.authResult || {};
+  const enrolled = auth.enrolled || {};
+  const lines = [];
+  if (r.tokenCount) {
+    lines.push(`Token / JSON ${r.tokenCount} 条：新增 ${Number(token.added) || 0}，跳过 ${Number(token.skipped) || 0}`);
+  }
+  if (r.credCount) {
+    lines.push(auth.unavailable
+      ? `凭据 ${r.credCount} 条：自动授权不可用`
+      : `凭据 ${r.credCount} 条：成功 ${Number(auth.succeeded) || 0}，失败 ${Number(auth.failed) || 0}，入池新增 ${Number(enrolled.added) || 0}`);
+  }
+  box.appendChild(el("div", { class: "imp-result-title", text: lines.join("　|　") || "本次没有可处理的数据" }));
+  if (auth.unavailable) {
+    box.appendChild(el("div", { class: "imp-result-errors", text: String(auth.unavailable) }));
+  }
+  const tokenErrors = Array.isArray(token.errors) ? token.errors : [];
+  if (tokenErrors.length) {
+    box.appendChild(el("div", { class: "imp-result-errors", text: tokenErrors.slice(0, 5).map((x) => JSON.stringify(x)).join(" · ") }));
+  }
+  const failures = Array.isArray(r.failures) ? r.failures : [];
+  if (failures.length) {
+    const list = el("div", { class: "imp-result-errors" });
+    failures.slice(0, 8).forEach((f) => list.appendChild(el("div", { text: `${f.email}：${f.error}` })));
+    if (failures.length > 8) list.appendChild(el("div", { text: `…还有 ${failures.length - 8} 条` }));
+    box.appendChild(list);
+    box.appendChild(el("button", {
+      class: "btn", text: "把失败行放回输入框", onclick: () => {
+        const failed = new Set(failures.map((f) => String(f.email || "").toLowerCase()));
+        const rows = (imp.rows || []).filter((x) => x.kind === "credential" && failed.has(x.email.toLowerCase()));
+        imp.text = rowsToText(rows.length ? rows : pendingCredentials());
+        imp.rows = null;
+        imp.parse = null;
+        imp.result = null;
+        render();
+        toast("失败行已回填，可修改后重试");
+      },
+    }));
+  }
+  host.appendChild(box);
+}
+
 function renderOAuth(host) {
   host.innerHTML = "";
+  if (!imp.showManual) return;
   const pending = pendingCredentials();
-  if (!pending.length && !imp.oauth) return;
 
   const box = el("div", { class: "imp-oauth" });
-  box.appendChild(el("div", { class: "imp-section-title", text: `OAuth 授权（待处理 ${pending.length} 条）` }));
+  box.appendChild(el("div", { class: "imp-section-title", text: `手动 OAuth 授权（备用，待处理 ${pending.length} 条）` }));
   if (!imp.oauth) {
     box.appendChild(el("p", {
       class: "imp-hint",
-      text: "本机后端以 access_token 为账号主键，不提供「邮箱+密码+2FA 自动换 token」接口。这些凭据需要在系统浏览器里完成一次 OpenAI 登录，由后端换出 token 并落盘。2FA 密钥已随记录保留，登录时按页面提示输入验证码即可。",
+      text: "当自动授权环境不可用、或上游要求邮箱验证码时，可以在这里逐个用系统浏览器完成登录，再把 callback URL 贴回来换 token。一次只处理一个账号。",
     }));
+    if (!pending.length) {
+      box.appendChild(el("p", { class: "imp-hint", text: "当前没有待授权的凭据行。" }));
+      host.appendChild(box);
+      return;
+    }
     box.appendChild(el("button", {
       class: "btn primary",
       text: `为 ${pending[0].email} 开始授权`,
@@ -1490,14 +1699,7 @@ function renderOAuth(host) {
     const url = String(imp.oauth.authorize_url || "");
     box.appendChild(el("div", { class: "imp-oauth-actions" }, [
       el("a", { class: "btn primary", href: url, target: "_blank", rel: "noopener noreferrer", text: "打开授权页面" }),
-      el("button", {
-        class: "btn",
-        text: "复制链接",
-        onclick: async () => {
-          try { await navigator.clipboard.writeText(url); toast("授权链接已复制"); }
-          catch (e) { toast("复制失败，请手动选中链接", true); }
-        },
-      }),
+      el("button", { class: "btn", text: "复制链接", onclick: () => copy(url) }),
       el("button", { class: "btn", text: "取消", onclick: () => { imp.oauth = null; imp.callback = ""; render(); } }),
     ]));
     const urlInput = el("input", { class: "input imp-url", readonly: "readonly" });
@@ -1570,7 +1772,7 @@ async function finishOAuth() {
     imp.oauth = null;
     imp.callback = "";
     toast("账号已入池");
-    loadAccounts(true);
+    loadAccounts(true, true);
   } catch (e) {
     imp.oauthResult = "授权失败：" + String(e && e.message ? e.message : e);
     toast("授权失败", true);
@@ -1586,92 +1788,186 @@ function renderImport(stage) {
   page.appendChild(el("h1", { class: "page-title", text: "高级导入" }));
   page.appendChild(el("p", {
     class: "page-sub",
-    text: "每行一条，支持 邮箱----密码----2FA密钥、裸 access_token、完整账号 JSON（可整段粘贴数组）。",
+    text: "邮箱 / 密码 / 第三字段批量导入（每行一条）；也支持裸 access_token 与完整账号 JSON。",
   }));
 
   const note = el("div", { class: "imp-note" });
-  note.appendChild(el("div", { class: "imp-note-title", text: "两种内容，两条入池路径" }));
+  note.appendChild(el("div", { class: "imp-note-title", text: "格式与入池方式" }));
   note.appendChild(el("div", {
     class: "imp-note-body",
-    text: "Token / 完整账号 JSON 可以直接批量写入号池；邮箱密码凭据本机后端不提供自动登录，需要逐个走一次 OAuth 浏览器授权换取 token。解析出的 2FA 密钥只作为记录，不会被自动用来算验证码。",
+    text: "每行：邮箱----密码----2FA密钥（3 或 4 个连字符都识别），可选第 4 字段 access_token、第 5 字段 refresh_token。支持粘贴或选择 UTF-8 TXT 文件，# 开头的行会被忽略。",
+  }));
+  note.appendChild(el("div", {
+    class: "imp-note-body",
+    text: "自带未过期 token 的行直接写入号池；只有邮箱密码的行由本机 OAuth + TOTP 自动换 token 后入池。密码保留原样、重复邮箱自动跳过，失败行可一键回填重试。",
   }));
   page.appendChild(note);
 
   const section = el("div", { class: "section" });
   const ta = el("textarea", {
+    id: "impText",
     class: "input imp-input",
-    placeholder: "xxx@duck.com----6ZyL13214123PXy5e^----INRUA4HAVHPT5XXXXXXXX5TVH4NU2\neyJhbGciOi...（或粘贴完整账号 JSON 数组）",
-    oninput: (e) => { imp.text = e.target.value; imp.rows = null; imp.result = null; },
+    placeholder: "xxx@duck.com----6ZyL13214123PXy5e^----INRUA4HAVHPT5XXXXXXXX5TVH4NU2\nsecond@duck.com---your-password---BASE32SECRET\neyJhbGciOi...（或粘贴完整账号 JSON 数组）",
+    oninput: (e) => {
+      imp.text = e.target.value;
+      imp.rows = null;
+      imp.parse = null;
+      imp.result = null;
+      refreshSections();
+    },
   });
   ta.value = imp.text;
+
+  const fileInput = el("input", {
+    type: "file", accept: ".txt,text/plain", class: "imp-file", "aria-label": "选择账号 TXT 文件",
+    onchange: (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      if (f.size > 1024 * 1024) { toast("TXT 文件超过 1 MB，请分批导入", true); return; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        imp.text = String(reader.result || "");
+        ta.value = imp.text;
+        parseNow();
+      };
+      reader.readAsText(f, "utf-8");
+      e.target.value = "";
+    },
+  });
+
+  const proxyInput = el("input", {
+    class: "input imp-proxy",
+    placeholder: "代理（可选，如 http://127.0.0.1:7890；留空自动探测本机代理）",
+    "aria-label": "授权代理",
+    oninput: (e) => { imp.proxy = e.target.value; },
+  });
+  proxyInput.value = imp.proxy;
+
   const actions = el("div", { class: "imp-actions" }, [
+    el("button", { class: "btn", text: "解析并预览", onclick: () => parseNow() }),
     el("button", {
-      class: "btn",
-      text: "解析并预览",
-      onclick: () => {
-        imp.rows = parseImportText(imp.text);
-        imp.result = null;
-        renderImportRows(preview);
-        renderOAuth(oauthHost);
-        syncImportButtons();
-      },
+      class: "btn primary", id: "impSubmit",
+      text: imp.busy ? "正在授权并入池…" : "导入并授权入池",
+      disabled: imp.busy ? "disabled" : null,
+      onclick: submitImport,
     }),
     el("button", {
-      class: "btn primary",
-      id: "impSubmit",
-      text: imp.busy ? "正在入池…" : "导入并授权入池",
-      disabled: imp.busy ? "disabled" : null,
-      onclick: async () => {
-        if (imp.busy) return;
-        if (!imp.rows) imp.rows = parseImportText(imp.text);
-        const payloads = importableRows().map((r) => r.payload);
-        if (!payloads.length) {
-          const pending = pendingCredentials();
-          if (pending.length) return toast("这几行是邮箱密码凭据，请用下方 OAuth 授权入池", true);
-          return toast("没有可导入的 token 行，请先检查格式", true);
-        }
-        imp.busy = true;
-        syncImportButtons();
-        try {
-          const result = await call("import_accounts", { accounts: payloads });
-          imp.result = result;
-          toast("导入完成");
-          await loadAccounts(true);
-        } catch (e) {
-          imp.result = { added: 0, skipped: 0, errors: [{ error: String(e && e.message ? e.message : e) }] };
-          toast("导入失败", true);
-        } finally {
-          imp.busy = false;
-          render();
-        }
+      class: "btn", text: "清空输入", onclick: () => {
+        imp.text = "";
+        imp.rows = null;
+        imp.parse = null;
+        imp.result = null;
+        imp.oauth = null;
+        imp.callback = "";
+        render();
       },
     }),
   ]);
-  section.appendChild(el("div", { class: "imp-pad" }, [ta, actions]));
+  section.appendChild(el("div", { class: "imp-pad" }, [fileInput, ta, proxyInput, actions]));
   page.appendChild(section);
 
+  const statsHost = el("div");
+  page.appendChild(statsHost);
   const preview = el("div", { class: "imp-table" });
-  renderImportRows(preview);
   page.appendChild(preview);
-
   const resultHost = el("div");
-  if (imp.result) resultHost.appendChild(importSummary(imp.result));
   page.appendChild(resultHost);
-
+  page.appendChild(el("button", {
+    class: "btn imp-manual-toggle",
+    text: imp.showManual ? "收起手动 OAuth 授权（备用）" : "手动 OAuth 授权（备用）",
+    onclick: () => { imp.showManual = !imp.showManual; render(); },
+  }));
   const oauthHost = el("div");
-  renderOAuth(oauthHost);
   page.appendChild(oauthHost);
 
   stage.appendChild(page);
+  refreshSections();
+  syncImportButtons();
+
+  function refreshSections() {
+    renderImportStats(statsHost);
+    renderImportRows(preview);
+    renderImportResult(resultHost);
+    renderOAuth(oauthHost);
+    syncImportButtons();
+  }
+
+  function parseNow() {
+    const parsed = parseImportText(imp.text);
+    imp.rows = parsed.rows;
+    imp.parse = parsed;
+    imp.result = null;
+    refreshSections();
+  }
+
+  async function submitImport() {
+    if (imp.busy) return;
+    if (!imp.rows) parseNow();
+    const tokens = importableRows();
+    const creds = pendingCredentials();
+    if (!tokens.length && !creds.length) {
+      const bad = imp.parse && imp.parse.errors ? imp.parse.errors.length : 0;
+      toast(bad ? "所有行格式都不正确，请看下方逐行错误" : "没有可导入的数据，请先检查格式", true);
+      return;
+    }
+    imp.busy = true;
+    syncImportButtons();
+    const failures = [];
+    const tokenCount = tokens.length;
+    const credCount = creds.length;
+    let tokenResult = null;
+    let authResult = null;
+    try {
+      if (tokens.length) {
+        try {
+          tokenResult = await call("import_accounts", { accounts: tokens.map((r) => r.payload) });
+        } catch (e) {
+          const msg = String(e && e.message ? e.message : e);
+          tokenResult = { added: 0, skipped: 0, errors: [{ error: msg }] };
+          tokens.forEach((r) => failures.push({ email: r.label, error: "直接入池失败" }));
+        }
+      }
+      if (creds.length) {
+        try {
+          authResult = await call("authorize_credentials", {
+            credentials: creds.map((r) => ({
+              email: r.email,
+              password: r.password,
+              totp_secret: r.totp || "",
+              access_token: r.accessToken || "",
+              refresh_token: r.refreshToken || "",
+            })),
+            proxy: String(imp.proxy || "").trim(),
+          });
+          const results = Array.isArray(authResult.results) ? authResult.results : [];
+          const okEmails = new Set(results.filter((x) => x.ok).map((x) => String(x.email || "").toLowerCase()));
+          imp.rows = (imp.rows || []).map((r) =>
+            r.kind === "credential" && okEmails.has(r.email.toLowerCase())
+              ? Object.assign({}, r, { authorized: true }) : r
+          );
+          results.filter((x) => !x.ok).forEach((x) =>
+            failures.push({ email: String(x.email || "—"), error: String(x.error || "授权失败") })
+          );
+        } catch (e) {
+          authResult = { unavailable: String(e && e.message ? e.message : e), results: [] };
+          creds.forEach((r) => failures.push({ email: r.email, error: "自动授权不可用" }));
+        }
+      }
+      imp.result = { tokenResult, authResult, failures, tokenCount, credCount };
+      try { await loadAccounts(true, true); } catch (e) {}
+      toast(failures.length ? `完成，但有 ${failures.length} 条失败` : "导入完成", !!failures.length);
+    } finally {
+      imp.busy = false;
+      render();
+    }
+  }
 
   function syncImportButtons() {
     const btn = $("#impSubmit");
     if (!btn) return;
-    const rows = imp.rows || [];
-    btn.disabled = imp.busy || (!importableRows().length && !rows.length);
-    btn.textContent = imp.busy ? "正在入池…" : "导入并授权入池";
+    btn.disabled = imp.busy || !String(imp.text || "").trim();
+    btn.textContent = imp.busy ? "正在授权并入池…" : "导入并授权入池";
   }
-  syncImportButtons();
 }
 
 /* ------------------------------------------------------------------ 设置 */
