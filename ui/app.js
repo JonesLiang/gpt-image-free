@@ -119,12 +119,17 @@ const state = {
   // 输入
   input: "",
   reference: null,
-  busy: false,
   pendingInject: false,
+  // 生成任务：按会话 id 跟踪，切会话不打断，结果回写发起它的会话
+  jobs: [],
   // 更新
   updateState: null,
+  updateChecked: false,
   // 侧栏折叠
   sidebarCollapsed: false,
+  // 后端诊断
+  onlineError: "",
+  adminKeyReady: true,
   // DOM 缓存
   dom: null,
   stageRoute: null,
@@ -134,6 +139,7 @@ let tickTimer = null;
 let genTimer = null;
 let saveTimer = null;
 let autoUpdateTimer = null;
+let updateInFlight = null;
 let composing = false;
 
 /* ------------------------------------------------------------------ 账号 */
@@ -166,12 +172,14 @@ async function loadAccounts(force) {
   try {
     state.accounts = await call(force ? "refresh_accounts" : "list_accounts");
     state.online = true;
+    state.onlineError = "";
     if (!state.boundToken) {
       const best = pickBestAccount();
       if (best) state.boundToken = best.access_token;
     }
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
+    state.onlineError = msg;
     if (msg.includes("后端未连接")) state.online = false;
     else {
       state.online = true;
@@ -321,7 +329,7 @@ function buildHome(stage) {
   sidebar.appendChild(
     el("div", { class: "sidebar-head" }, [
       el("button", { class: "sidebar-logo", title: "新建对话", "aria-label": "新建对话", onclick: () => newConversation() }),
-      el("span", { class: "spacer" }),
+      el("button", { class: "new-chat", title: "新建对话", text: "+ 新建对话", onclick: () => newConversation() }),
       iconBtn(ICON_COLLAPSE, "折叠侧栏", toggleSidebar),
     ])
   );
@@ -484,7 +492,7 @@ function renderAiTurn(t) {
     wrap.appendChild(
       el("div", { class: "gen-card" }, [
         el("div", { class: "gen-spinner" }),
-        el("div", { class: "gen-status", text: "正在生成图像…" }),
+        el("div", { class: "gen-status", "data-start": String(t.createdAt || Date.now()), text: "正在生成图像…" }),
       ])
     );
     return wrap;
@@ -541,15 +549,18 @@ function renderAiTurn(t) {
 }
 
 function syncGenAnimation() {
-  const running = state.conversation && state.conversation.turns.some((t) => t.status === "running");
+  const running = state.conversation && state.conversation.turns.some((t) => t.status === "running" || t.status === "pending");
   if (running && !genTimer) {
+    // 生图本来就要几十秒到一两分钟，显示已用时能让人确认「还在跑」而不是卡死。
     const texts = ["正在理解你的描述…", "正在绘制画面…", "正在收尾，马上就好…", "还在生成，请稍等…"];
-    let i = 0;
     genTimer = setInterval(() => {
-      i = (i + 1) % texts.length;
       const node = $(".gen-status", state.dom && state.dom.inner);
-      if (node) node.textContent = texts[i];
-    }, 4500);
+      if (!node) return;
+      const start = Number(node.dataset.start) || Date.now();
+      const sec = Math.max(0, Math.floor((Date.now() - start) / 1000));
+      const idx = Math.min(texts.length - 1, Math.floor(sec / 15));
+      node.textContent = `${texts[idx]} · 已用时 ${sec} 秒`;
+    }, 1000);
   } else if (!running && genTimer) {
     clearInterval(genTimer);
     genTimer = null;
@@ -566,8 +577,9 @@ function scrollToBottom(force) {
 
 /* ------------------------------------------------------------------ 会话持久化 */
 
-function normalizeConversation(raw) {
+function normalizeConversation(raw, opts) {
   const c = raw || {};
+  const keepRunning = !!(opts && opts.keepRunning);
   const conv = {
     id: c.id || uid("c"),
     title: c.title || "新会话",
@@ -576,7 +588,7 @@ function normalizeConversation(raw) {
     turns: Array.isArray(c.turns) ? c.turns : [],
   };
   conv.turns.forEach((t) => {
-    if (t.status === "running" || t.status === "pending") {
+    if (!keepRunning && (t.status === "running" || t.status === "pending")) {
       t.status = "error";
       t.error = "上次生成未完成，可重新编辑后重发";
     }
@@ -614,19 +626,24 @@ function persistConversation(immediate) {
 }
 
 async function newConversation() {
-  if (state.conversation && state.conversation.turns.length === 0) {
-    focusComposer();
-    return;
+  const current = state.conversation;
+  // 之前在空会话里点「新建」会直接 return，看起来像按钮坏了。现在始终新建；
+  // 已落盘的空会话先删掉，避免侧栏堆一串「新会话」。有后台任务时不动它。
+  if (current && current.turns.length === 0 && !hasJobsFor(current.id)) {
+    if (state.conversations.some((m) => m.id === current.id)) {
+      try { await call("delete_conversation", { id: current.id }); } catch (e) {}
+    }
   }
   const now = Date.now();
   state.conversation = { id: uid("c"), title: "新会话", createdAt: now, updatedAt: now, turns: [] };
   state.input = "";
   state.reference = null;
-  state.busy = false;
   state.pendingInject = false;
   state.accountPopOpen = false;
   if (state.dom) {
     state.dom.textarea.value = "";
+    state.dom.msgSig = "";
+    state.dom.listSig = "";
     autoGrow();
   }
   closeMenu();
@@ -640,10 +657,10 @@ async function switchConversation(id) {
   if (state.conversation && state.conversation.id === id) return;
   try {
     const data = await call("load_conversation", { id });
-    state.conversation = normalizeConversation(data || { id, turns: [] });
+    // 该会话还有后台生成任务时，切回来别把 running 误判成「上次生成失败」。
+    state.conversation = normalizeConversation(data || { id, turns: [] }, { keepRunning: hasJobsFor(id) });
     state.input = "";
     state.reference = null;
-    state.busy = false;
     state.accountPopOpen = false;
     if (state.dom) {
       state.dom.textarea.value = "";
@@ -845,19 +862,54 @@ function updateComposer() {
   d.title.textContent = conv ? conv.title : "新会话";
   d.sub.textContent = conv && conv.turns.length ? `共 ${conv.turns.length} 轮 · 对话会自动保存在本机` : "描述画面，或上传参考图继续修改";
 
-  d.offline.hidden = state.online !== false;
-  if (state.online === false) {
+  // 不只是「连不上」才提示：Windows 上 401（admin-key 不对）、404（端口不对）
+  // 同样会让账号列表为空，用户容易误判成「没有账号」。把底层错误一并写出来。
+  const showNotice = state.online === false || !!state.onlineError;
+  d.offline.hidden = !showNotice;
+  if (showNotice) {
     d.offline.innerHTML = "";
-    d.offline.appendChild(el("span", { text: "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务。" }));
+    const offline = state.online === false;
+    const auth = /40[13]/.test(state.onlineError);
+    const title = offline
+      ? "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务。"
+      : auth
+        ? "后端在线，但 admin-key 校验失败。账号列表为空不是「没有账号」。"
+        : "后端已连通，但账号信息读取失败。";
+    d.offline.appendChild(
+      el("div", { class: "notice-copy" }, [
+        el("div", { class: "notice-title", text: title }),
+        el("div", {
+          class: "notice-detail",
+          text: [
+            `连接地址 ${state.baseUrl || "http://127.0.0.1:38650"}`,
+            state.adminKeyReady ? "admin-key 已找到" : "未找到 admin-key（检查后端数据目录）",
+            state.onlineError || "连接被拒绝",
+          ].join(" · "),
+        }),
+      ])
+    );
     d.offline.appendChild(el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) }));
   }
 
-  d.popHolder.innerHTML = "";
-  if (state.accountPopOpen) d.popHolder.appendChild(buildAccountPop());
+  // 账号弹层只在状态/账号数据变化时重建，避免定时 render 打断滚动和点击。
+  const popSig = state.accountPopOpen
+    ? `${state.accounts.length}:${state.loadingAccounts}:${state.boundToken}`
+    : "closed";
+  if (d.popSig !== popSig) {
+    d.popSig = popSig;
+    d.popHolder.innerHTML = "";
+    if (state.accountPopOpen) d.popHolder.appendChild(buildAccountPop());
+  }
+}
+
+/** 同一会话串行（上下文有依赖），不同会话可以并行后台生成。 */
+function hasJobsFor(convId) {
+  return state.jobs.some((j) => j.convId === convId);
 }
 
 function canSend() {
-  if (state.busy || !state.conversation) return false;
+  if (!state.conversation) return false;
+  if (hasJobsFor(state.conversation.id)) return false;
   if (!state.input.trim() && !state.reference) return false;
   const acct = activeAccount();
   return !!acct && !!acct.usable;
@@ -889,12 +941,13 @@ function buildAccountPop() {
         el("button", {
           class: "acct-row" + (a.access_token === state.boundToken ? " selected" : "") + (a.usable ? "" : " disabled"),
           disabled: a.usable ? null : "disabled",
-          onclick: () => {
+          onclick: (e) => {
+            // 阻止冒泡：document 的「点外部关闭」不能在选中后又触发一次。
+            e.stopPropagation();
             state.boundToken = a.access_token;
-            state.accountPopOpen = false;
             state.pendingInject = true;
             toast("已切换到 " + a.name);
-            render();
+            closeAccountPop();
           },
         }, [
           el("div", { class: "acct-main" }, [el("div", { class: "acct-name", text: a.name }), meta]),
@@ -908,7 +961,16 @@ function buildAccountPop() {
   return pop;
 }
 
-function toggleAccountPop() {
+/** 统一关闭入口：选中账号、点空白、Esc 都走这里，状态一定收敛。 */
+function closeAccountPop() {
+  if (!state.accountPopOpen) return;
+  state.accountPopOpen = false;
+  render();
+}
+
+function toggleAccountPop(e) {
+  // 不让 document 的「点外部关闭」把刚打开的弹层立刻关掉。
+  if (e) e.stopPropagation();
   state.accountPopOpen = !state.accountPopOpen;
   render();
 }
@@ -943,6 +1005,9 @@ async function sendPrompt() {
   const acct = activeAccount();
   if (!acct) return toast("没有可用账号", true);
 
+  // 从这一刻起所有引用都锁定到「发起这次生成的会话」，切会话不会改写别处。
+  const conv = state.conversation;
+  const convId = conv.id;
   const prompt = state.input.trim() || "请根据参考图生成相似风格的图片";
   const refDataUrl = state.reference ? state.reference.dataUrl : null;
   const prev = lastDoneImage();
@@ -955,40 +1020,46 @@ async function sendPrompt() {
     error: null,
     account: acct.name,
     reference: refDataUrl,
-    refRound: !refDataUrl && prev ? state.conversation.turns.indexOf(prev) + 1 : 0,
+    refRound: 0,
     injected: false,
     createdAt: Date.now(),
   };
-  state.conversation.turns.push(turn);
-  if (state.conversation.title === "新会话") {
-    state.conversation.title = prompt.length > 18 ? prompt.slice(0, 18) + "…" : prompt;
+  conv.turns.push(turn);
+  if (conv.title === "新会话") {
+    conv.title = prompt.length > 18 ? prompt.slice(0, 18) + "…" : prompt;
   }
   state.input = "";
   state.reference = null;
-  state.busy = true;
 
   const d = state.dom;
   if (d) {
     d.textarea.value = "";
     d.msgSig = "";
+    d.listSig = "";
     autoGrow();
     renderReferenceChip();
   }
-  persistConversation();
-  render();
-  focusComposer();
-
-  // 手动上传的参考图优先；否则沿用上一张成功的图继续改（保持画面连贯）。
+  // 手动上传的参考图优先。「自动沿用上一张图」默认关闭：它要改走 edits
+  // 并上传整张 PNG，是连续对话里最明显的耗时来源；需要连贯性可在设置里开启。
   let reference = refDataUrl ? stripDataUrl(refDataUrl) : null;
-  if (!reference && prev) reference = stripDataUrl(prev.image);
+  if (!reference && state.settings.auto_reference && prev) {
+    reference = stripDataUrl(prev.image);
+    turn.refRound = conv.turns.indexOf(prev) + 1;
+  }
 
   let finalPrompt = prompt;
-  if (state.pendingInject && state.conversation.turns.length > 1) {
-    finalPrompt = composeInjectedPrompt(state.conversation.turns.slice(0, -1), prompt, state.settings.context_rounds);
+  if (state.pendingInject && conv.turns.length > 1) {
+    finalPrompt = composeInjectedPrompt(conv.turns.slice(0, -1), prompt, state.settings.context_rounds);
     turn.injected = true;
     state.pendingInject = false;
   }
 
+  state.jobs.push({ convId, turnId: turn.id, startedAt: Date.now() });
+  // 立即落盘：这样中途切走时从磁盘读回来的会话里已经有这条完整的 running
+  // turn（含上下文标记），后台任务完成后才找得到它并回写结果。
+  await persistConversation(true);
+  render();
+  focusComposer();
   try {
     const result = await call("generate", {
       prompt: finalPrompt,
@@ -996,20 +1067,49 @@ async function sendPrompt() {
       reference,
       textReply: state.settings.text_reply,
     });
-    turn.status = "done";
-    turn.image = result.image;
-    turn.text = result.text || null;
-    turn.path = result.path || null;
+    await finishJob(convId, turn.id, result, null);
     loadAccounts(false);
   } catch (e) {
-    turn.status = "error";
-    turn.error = String(e && e.message ? e.message : e);
+    await finishJob(convId, turn.id, null, e);
   } finally {
-    state.busy = false;
-    if (d) d.msgSig = "";
-    persistConversation(true);
+    state.jobs = state.jobs.filter((j) => j.turnId !== turn.id);
+    if (state.dom) {
+      state.dom.msgSig = "";
+      state.dom.listSig = "";
+    }
     render();
     syncSendBtn();
+  }
+}
+
+/** 把结果写回发起它的那个会话，而不是当前显示的会话。
+    切走后原会话已不在内存里，按 id 从磁盘读回来改完再存，任务全程后台跑。 */
+async function finishJob(convId, turnId, result, error) {
+  const current = state.conversation && state.conversation.id === convId;
+  let target = current ? state.conversation : null;
+  if (!target) {
+    try { target = await call("load_conversation", { id: convId }); } catch (e) { target = null; }
+  }
+  if (!target || !Array.isArray(target.turns)) return;
+  const t = target.turns.find((x) => x.id === turnId);
+  if (!t) return;
+  if (result) {
+    t.status = "done";
+    t.image = result.image;
+    t.text = result.text || null;
+    t.path = result.path || null;
+    t.error = null;
+  } else {
+    t.status = "error";
+    t.error = String(error && error.message ? error.message : error);
+  }
+  target.updatedAt = Date.now();
+  try {
+    await call("save_conversation", { conversation: target });
+    await refreshConversations();
+    if (!current) toast("另一个会话的图片已生成完成");
+  } catch (e) {
+    toast("生成结果保存失败：" + String(e && e.message ? e.message : e), true);
   }
 }
 
@@ -1198,16 +1298,380 @@ function copy(text) {
 
 /* ------------------------------------------------------------------ 导入 */
 
+/** 导入页状态放模块级：非首页路由会被 render() 全量重建（loadAccounts 和定时
+    刷新都会触发），输入框内容、解析结果、OAuth 会话都必须能恢复。 */
+const imp = {
+  text: "",
+  rows: null,
+  result: null,
+  busy: false,
+  oauth: null,
+  callback: "",
+  oauthBusy: false,
+  oauthResult: null,
+};
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const JWTISH_RE = /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+$/;
+
+function isTotpSecret(s) {
+  const clean = String(s || "").replace(/[\s=-]/g, "").toUpperCase();
+  return clean.length >= 16 && /^[A-Z2-7]+$/.test(clean);
+}
+
+function shortToken(s) {
+  const v = String(s || "");
+  return v.length > 18 ? v.slice(0, 10) + "…" + v.slice(-6) : v;
+}
+
+/** 每行优先按 ---- 切；密码里常带符号，所以绝不按任意标点乱切。 */
+function splitCredential(line) {
+  if (/-{3,}/.test(line)) return line.split(/-{3,}/).map((s) => s.trim());
+  if (line.includes("\t")) return line.split(/\t+/).map((s) => s.trim());
+  if (line.includes("|")) return line.split("|").map((s) => s.trim());
+  const byColon = line.split(":");
+  if (byColon.length === 3 && EMAIL_RE.test(byColon[0].trim())) {
+    return byColon.map((s) => s.trim());
+  }
+  return [line.trim()];
+}
+
+function accountFromObject(obj) {
+  const o = obj && typeof obj === "object" ? obj : {};
+  const token = String(o.access_token || o.accessToken || "").trim();
+  const email = String(o.email || "").trim();
+  const password = String(o.password || "").trim();
+  const totp = String(o.totp_secret || o.totpSecret || o.otp_secret || o["2fa"] || "").trim();
+  if (token) {
+    const payload = Object.assign({}, o, { access_token: token });
+    delete payload.accessToken;
+    return { kind: "token", payload };
+  }
+  if (EMAIL_RE.test(email) && password) {
+    return { kind: "credential", email, password, totp };
+  }
+  return null;
+}
+
+/** 支持三种输入：email----password----2FA、裸 access_token、完整账号 JSON。 */
+function parseImportText(text) {
+  const rows = [];
+  const trimmed = String(text || "").trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const data = JSON.parse(trimmed);
+      (Array.isArray(data) ? data : [data]).forEach((o, i) => {
+        const entry = accountFromObject(o);
+        rows.push(entry
+          ? Object.assign(entry, { line: i + 1, label: entry.kind === "token" ? shortToken(entry.payload.access_token) : entry.email })
+          : { kind: "invalid", line: i + 1, raw: "JSON 对象", reason: "缺少 access_token 或 邮箱+密码" });
+      });
+      return dedupeImportRows(rows);
+    } catch (e) {
+      // 多行 JSON 粘贴时可能有换行，落到逐行解析兜底。
+    }
+  }
+  String(text || "").split(/\r?\n/).forEach((line, idx) => {
+    const raw = line.trim();
+    if (!raw || raw.startsWith("#")) return;
+    let entry = null;
+    if (raw.startsWith("{")) {
+      try { entry = accountFromObject(JSON.parse(raw)); } catch (e) {}
+      if (!entry) {
+        rows.push({ kind: "invalid", line: idx + 1, raw: shortToken(raw), reason: "JSON 解析失败或字段不足" });
+        return;
+      }
+    } else if (JWTISH_RE.test(raw) || /^eyJ/.test(raw)) {
+      entry = { kind: "token", payload: { access_token: raw } };
+    } else {
+      const parts = splitCredential(raw);
+      if (parts.length >= 2 && EMAIL_RE.test(parts[0])) {
+        entry = { kind: "credential", email: parts[0], password: parts[1], totp: parts[2] || "" };
+      }
+    }
+    if (!entry) {
+      rows.push({ kind: "invalid", line: idx + 1, raw: shortToken(raw), reason: "无法识别格式" });
+      return;
+    }
+    entry.line = idx + 1;
+    entry.label = entry.kind === "token" ? shortToken(entry.payload.access_token) : entry.email;
+    rows.push(entry);
+  });
+  return dedupeImportRows(rows);
+}
+
+function dedupeImportRows(rows) {
+  const seen = new Set();
+  return rows.map((r) => {
+    if (r.kind === "invalid") return r;
+    const key = r.kind === "token" ? r.payload.access_token : r.email.toLowerCase();
+    if (seen.has(key)) return Object.assign({}, r, { duplicate: true });
+    seen.add(key);
+    return r;
+  });
+}
+
+function importableRows() {
+  return (imp.rows || []).filter((r) => r.kind === "token" && !r.duplicate);
+}
+
+function pendingCredentials() {
+  return (imp.rows || []).filter((r) => r.kind === "credential" && !r.duplicate && !r.authorized);
+}
+
+function importSummary(result) {
+  const added = Number(result && result.added) || 0;
+  const skipped = Number(result && result.skipped) || 0;
+  const errors = Array.isArray(result && result.errors) ? result.errors : [];
+  const box = el("div", { class: "imp-result" });
+  box.appendChild(el("div", { class: "imp-result-title", text: `入池完成：新增 ${added} 个，跳过 ${skipped} 个` }));
+  if (errors.length) {
+    box.appendChild(el("div", { class: "imp-result-errors", text: errors.slice(0, 5).map((x) => JSON.stringify(x)).join(" · ") }));
+  }
+  return box;
+}
+
+function renderImportRows(host) {
+  host.innerHTML = "";
+  const rows = imp.rows || [];
+  if (!rows.length) {
+    host.appendChild(el("div", { class: "imp-empty", text: "粘贴内容后点「解析并预览」。" }));
+    return;
+  }
+  const head = el("div", { class: "imp-row imp-head" }, [
+    el("span", { text: "#" }), el("span", { text: "类型" }), el("span", { text: "标识" }),
+    el("span", { text: "2FA" }), el("span", { text: "状态" }),
+  ]);
+  host.appendChild(head);
+  rows.slice(0, 60).forEach((r) => {
+    const kind = r.kind === "token" ? "Token" : r.kind === "credential" ? "邮箱密码" : "无效";
+    const totp = r.kind === "credential"
+      ? (isTotpSecret(r.totp) ? "有效密钥" : r.totp ? "格式存疑" : "未提供")
+      : "—";
+    const status = r.kind === "invalid"
+      ? (r.reason || "无法识别")
+      : r.authorized ? "已授权入池"
+      : r.duplicate ? "重复，已跳过"
+      : r.kind === "token" ? "可直接入池"
+      : "需 OAuth 授权";
+    host.appendChild(el("div", { class: "imp-row" + (r.kind === "invalid" ? " bad" : "") }, [
+      el("span", { class: "imp-num", text: String(r.line) }),
+      el("span", { class: "imp-kind", text: kind }),
+      el("span", { class: "imp-label", title: r.kind === "token" ? "" : r.email, text: r.label || String(r.raw || "") }),
+      el("span", { text: totp }),
+      el("span", { class: r.kind === "invalid" || r.duplicate ? "imp-bad" : "imp-ok", text: status }),
+    ]));
+  });
+  if (rows.length > 60) {
+    host.appendChild(el("div", { class: "imp-empty", text: `还有 ${rows.length - 60} 行未展示，导入时会一并处理。` }));
+  }
+}
+
+function renderOAuth(host) {
+  host.innerHTML = "";
+  const pending = pendingCredentials();
+  if (!pending.length && !imp.oauth) return;
+
+  const box = el("div", { class: "imp-oauth" });
+  box.appendChild(el("div", { class: "imp-section-title", text: `OAuth 授权（待处理 ${pending.length} 条）` }));
+  if (!imp.oauth) {
+    box.appendChild(el("p", {
+      class: "imp-hint",
+      text: "本机后端以 access_token 为账号主键，不提供「邮箱+密码+2FA 自动换 token」接口。这些凭据需要在系统浏览器里完成一次 OpenAI 登录，由后端换出 token 并落盘。2FA 密钥已随记录保留，登录时按页面提示输入验证码即可。",
+    }));
+    box.appendChild(el("button", {
+      class: "btn primary",
+      text: `为 ${pending[0].email} 开始授权`,
+      disabled: imp.oauthBusy ? "disabled" : null,
+      onclick: () => startOAuth(pending[0].email),
+    }));
+  } else {
+    box.appendChild(el("div", { class: "imp-hint", text: `当前授权账号：${imp.oauth.email} · 会话有效期有限，请一次完成。` }));
+    const url = String(imp.oauth.authorize_url || "");
+    box.appendChild(el("div", { class: "imp-oauth-actions" }, [
+      el("a", { class: "btn primary", href: url, target: "_blank", rel: "noopener noreferrer", text: "打开授权页面" }),
+      el("button", {
+        class: "btn",
+        text: "复制链接",
+        onclick: async () => {
+          try { await navigator.clipboard.writeText(url); toast("授权链接已复制"); }
+          catch (e) { toast("复制失败，请手动选中链接", true); }
+        },
+      }),
+      el("button", { class: "btn", text: "取消", onclick: () => { imp.oauth = null; imp.callback = ""; render(); } }),
+    ]));
+    const urlInput = el("input", { class: "input imp-url", readonly: "readonly" });
+    urlInput.value = url;
+    urlInput.addEventListener("focus", () => urlInput.select());
+    box.appendChild(urlInput);
+    box.appendChild(el("p", {
+      class: "imp-hint",
+      text: "登录成功后浏览器会跳到 platform.openai.com/auth/callback?... 页面（页面本身可能报错，属正常）。把地址栏完整 URL 粘贴到下面，或直接粘 code。",
+    }));
+    const cb = el("textarea", {
+      class: "input imp-callback",
+      placeholder: "粘贴 callback URL 或 code…",
+      oninput: (e) => { imp.callback = e.target.value; },
+    });
+    cb.value = imp.callback;
+    box.appendChild(cb);
+    box.appendChild(el("button", {
+      class: "btn primary",
+      text: imp.oauthBusy ? "正在换取 token…" : "完成授权并入池",
+      disabled: imp.oauthBusy ? "disabled" : null,
+      onclick: finishOAuth,
+    }));
+  }
+  if (imp.oauthResult) {
+    box.appendChild(el("div", { class: "imp-result" }, [
+      el("div", { class: "imp-result-title", text: String(imp.oauthResult) }),
+    ]));
+  }
+  host.appendChild(box);
+}
+
+async function startOAuth(email) {
+  imp.oauthBusy = true;
+  imp.oauthResult = null;
+  render();
+  try {
+    const info = await call("oauth_start", { emailHint: email });
+    const url = String(info && info.authorize_url || "");
+    if (!url) throw new Error("后端没有返回授权地址");
+    imp.oauth = { email, session_id: String(info.session_id || ""), authorize_url: url };
+    imp.callback = "";
+  } catch (e) {
+    toast("发起授权失败：" + String(e && e.message ? e.message : e), true);
+  } finally {
+    imp.oauthBusy = false;
+    render();
+  }
+}
+
+async function finishOAuth() {
+  if (!imp.oauth) return;
+  const callback = String(imp.callback || "").trim();
+  if (!callback) return toast("请先粘贴 callback URL 或 code", true);
+  imp.oauthBusy = true;
+  render();
+  try {
+    const email = imp.oauth.email;
+    const result = await call("oauth_finish", {
+      sessionId: imp.oauth.session_id,
+      callback,
+    });
+    const added = Number(result && result.added) || 0;
+    imp.oauthResult = added > 0
+      ? `${email} 授权成功，已入池 ${added} 个账号`
+      : `${email} 授权完成，账号可能已存在（跳过）`;
+    imp.rows = (imp.rows || []).map((r) =>
+      r.kind === "credential" && r.email === email ? Object.assign({}, r, { authorized: true }) : r
+    );
+    imp.oauth = null;
+    imp.callback = "";
+    toast("账号已入池");
+    loadAccounts(true);
+  } catch (e) {
+    imp.oauthResult = "授权失败：" + String(e && e.message ? e.message : e);
+    toast("授权失败", true);
+  } finally {
+    imp.oauthBusy = false;
+    render();
+  }
+}
+
 function renderImport(stage) {
   const page = el("div", { class: "page" });
   page.appendChild(pageChrome());
   page.appendChild(el("h1", { class: "page-title", text: "高级导入" }));
-  page.appendChild(el("p", { class: "page-sub", text: "批量导入账号。每行一个，格式为「邮箱密码凭据」，由后端解析。" }));
+  page.appendChild(el("p", {
+    class: "page-sub",
+    text: "每行一条，支持 邮箱----密码----2FA密钥、裸 access_token、完整账号 JSON（可整段粘贴数组）。",
+  }));
+
+  const note = el("div", { class: "imp-note" });
+  note.appendChild(el("div", { class: "imp-note-title", text: "两种内容，两条入池路径" }));
+  note.appendChild(el("div", {
+    class: "imp-note-body",
+    text: "Token / 完整账号 JSON 可以直接批量写入号池；邮箱密码凭据本机后端不提供自动登录，需要逐个走一次 OAuth 浏览器授权换取 token。解析出的 2FA 密钥只作为记录，不会被自动用来算验证码。",
+  }));
+  page.appendChild(note);
+
   const section = el("div", { class: "section" });
-  const ta = el("textarea", { class: "input", style: "width:100%;min-height:180px;padding:12px;resize:vertical;font-family:monospace", placeholder: "每行一个账号凭据…" });
-  section.appendChild(el("div", { style: "padding:16px 18px" }, [ta]));
+  const ta = el("textarea", {
+    class: "input imp-input",
+    placeholder: "xxx@duck.com----6ZyL13214123PXy5e^----INRUA4HAVHPT5XXXXXXXX5TVH4NU2\neyJhbGciOi...（或粘贴完整账号 JSON 数组）",
+    oninput: (e) => { imp.text = e.target.value; imp.rows = null; imp.result = null; },
+  });
+  ta.value = imp.text;
+  const actions = el("div", { class: "imp-actions" }, [
+    el("button", {
+      class: "btn",
+      text: "解析并预览",
+      onclick: () => {
+        imp.rows = parseImportText(imp.text);
+        imp.result = null;
+        renderImportRows(preview);
+        renderOAuth(oauthHost);
+        syncImportButtons();
+      },
+    }),
+    el("button", {
+      class: "btn primary",
+      id: "impSubmit",
+      text: imp.busy ? "正在入池…" : "导入并授权入池",
+      disabled: imp.busy ? "disabled" : null,
+      onclick: async () => {
+        if (imp.busy) return;
+        if (!imp.rows) imp.rows = parseImportText(imp.text);
+        const payloads = importableRows().map((r) => r.payload);
+        if (!payloads.length) {
+          const pending = pendingCredentials();
+          if (pending.length) return toast("这几行是邮箱密码凭据，请用下方 OAuth 授权入池", true);
+          return toast("没有可导入的 token 行，请先检查格式", true);
+        }
+        imp.busy = true;
+        syncImportButtons();
+        try {
+          const result = await call("import_accounts", { accounts: payloads });
+          imp.result = result;
+          toast("导入完成");
+          await loadAccounts(true);
+        } catch (e) {
+          imp.result = { added: 0, skipped: 0, errors: [{ error: String(e && e.message ? e.message : e) }] };
+          toast("导入失败", true);
+        } finally {
+          imp.busy = false;
+          render();
+        }
+      },
+    }),
+  ]);
+  section.appendChild(el("div", { class: "imp-pad" }, [ta, actions]));
   page.appendChild(section);
+
+  const preview = el("div", { class: "imp-table" });
+  renderImportRows(preview);
+  page.appendChild(preview);
+
+  const resultHost = el("div");
+  if (imp.result) resultHost.appendChild(importSummary(imp.result));
+  page.appendChild(resultHost);
+
+  const oauthHost = el("div");
+  renderOAuth(oauthHost);
+  page.appendChild(oauthHost);
+
   stage.appendChild(page);
+
+  function syncImportButtons() {
+    const btn = $("#impSubmit");
+    if (!btn) return;
+    const rows = imp.rows || [];
+    btn.disabled = imp.busy || (!importableRows().length && !rows.length);
+    btn.textContent = imp.busy ? "正在入池…" : "导入并授权入池";
+  }
+  syncImportButtons();
 }
 
 /* ------------------------------------------------------------------ 设置 */
@@ -1225,6 +1689,10 @@ function renderSettings(stage) {
   section.appendChild(el("div", { class: "field" }, [
     el("div", {}, [el("div", { class: "field-label", text: "换号上下文轮数" }), el("div", { class: "field-hint", text: "换号后注入最近多少轮文字，编号保留真实轮次。" })]),
     el("input", { class: "input", type: "number", min: "1", max: "50", value: String(state.settings.context_rounds), onchange: (e) => saveSettings({ context_rounds: Number(e.target.value) || 5 }) }),
+  ]));
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "自动沿用上一张图" }), el("div", { class: "field-hint", text: "开启后每轮会带上上一张成品图继续改，画面更连贯，但要多上传几 MB 并改走改图通道，生成明显更慢。默认关闭以优先速度。" })]),
+    el("button", { class: "switch" + (state.settings.auto_reference ? " on" : ""), role: "switch", "aria-checked": state.settings.auto_reference ? "true" : "false", onclick: () => saveSettings({ auto_reference: !state.settings.auto_reference }) }),
   ]));
   section.appendChild(el("div", { class: "field" }, [
     el("div", {}, [el("div", { class: "field-label", text: "启动时自动检查并更新" }), el("div", { class: "field-hint", text: "发现新版本时会在应用内自动下载并安装，完成后只需点一次重启。" })]),
@@ -1309,27 +1777,66 @@ function renderUpdateBar() {
   }
 }
 
-async function checkUpdate(manual) {
+const UPDATE_CACHE_KEY = "gif:update-cache";
+const UPDATE_TTL = 6 * 60 * 60 * 1000;
+
+/** 只缓存「已是最新」的结果；有新版本时绝不缓存，避免漏掉更新提示。 */
+function cachedNoUpdate() {
   try {
-    const info = await call("check_update");
-    state.update = info;
-    renderChrome();
-    if (info.has_update) {
-      state.updateState = { stage: "found", info };
-      renderUpdateBar();
-      if (!manual && state.settings.auto_check_update) {
-        clearTimeout(autoUpdateTimer);
-        // 留出足够时间让用户看到提示并点「稍后」；不点就全自动完成。
-        autoUpdateTimer = setTimeout(() => startAutoUpdate(), 8000);
-      }
-    } else if (manual) {
-      state.updateState = { stage: "idle" };
-      renderUpdateBar();
-      toast("已是最新版本");
+    const raw = JSON.parse(localStorage.getItem(UPDATE_CACHE_KEY) || "null");
+    if (raw && raw.ts && Date.now() - raw.ts < UPDATE_TTL && raw.info && !raw.info.has_update) {
+      return raw.info;
     }
-  } catch (e) {
-    if (manual) toast(String(e && e.message ? e.message : e), true);
+  } catch (e) {}
+  return null;
+}
+
+function cacheUpdate(info) {
+  try {
+    localStorage.setItem(UPDATE_CACHE_KEY, JSON.stringify({ ts: Date.now(), info }));
+  } catch (e) {}
+}
+
+/** 自动检查一个进程只做一次，「已是最新」再缓存 6 小时。
+    切会话、回首页、定时 render 都不会再向 GitHub 发请求；只有手动点
+    版本号 / 设置页「检查更新」才强制查，并用 updateInFlight 防连点。 */
+async function checkUpdate(manual) {
+  if (!manual) {
+    if (state.updateChecked || updateInFlight) return;
+    state.updateChecked = true;
+    const cached = cachedNoUpdate();
+    if (cached) {
+      state.update = cached;
+      renderChrome();
+      return;
+    }
   }
+  if (updateInFlight) return updateInFlight;
+  updateInFlight = (async () => {
+    try {
+      const info = await call("check_update");
+      state.update = info;
+      cacheUpdate(info);
+      renderChrome();
+      if (info.has_update) {
+        state.updateState = { stage: "found", info };
+        renderUpdateBar();
+        if (!manual && state.settings.auto_check_update) {
+          clearTimeout(autoUpdateTimer);
+          // 留出足够时间让用户看到提示并点「稍后」；不点就全自动完成。
+          autoUpdateTimer = setTimeout(() => startAutoUpdate(), 8000);
+        }
+      } else if (manual) {
+        state.updateState = { stage: "idle" };
+        renderUpdateBar();
+        toast("已是最新版本");
+      }
+    } catch (e) {
+      // 自动检查失败不写缓存，下次启动还能重试。
+      if (manual) toast(String(e && e.message ? e.message : e), true);
+    }
+  })().finally(() => { updateInFlight = null; });
+  return updateInFlight;
 }
 
 async function startAutoUpdate() {
@@ -1399,15 +1906,25 @@ function bindChrome() {
     if (e.key !== "Escape") return;
     closeLightbox();
     closeMenu();
-    if (state.accountPopOpen) {
-      state.accountPopOpen = false;
-      render();
-    }
+    closeAccountPop();
   });
   document.addEventListener("click", (e) => {
     if (!$("#avatarMenu").hidden && !e.target.closest("#avatarMenu,.avatar-btn")) closeMenu();
+    if (!state.accountPopOpen) return;
+    // composedPath 在事件派发时就固定了：账号行的 onclick 可能已经 render()
+    // 把弹层从 DOM 里移除，此时 closest() 会误判成「点到了外面」。
+    const path = typeof e.composedPath === "function" ? e.composedPath() : [];
+    const inside = path.some(
+      (n) => n && n.classList && (n.classList.contains("account-pop") || n.classList.contains("model-pill"))
+    );
+    if (!inside) closeAccountPop();
   });
-  tickTimer = setInterval(() => render(), 30000);
+  // 定时刷新只用于倒计时；账号弹层打开时跳过，避免打断滚动和点击。
+  // 导入页有输入框与进行中的 OAuth 会话，全量重建会清掉草稿，同样跳过。
+  tickTimer = setInterval(() => {
+    if (state.accountPopOpen || state.route === "import") return;
+    render();
+  }, 60000);
 }
 
 /* ------------------------------------------------------------------ 启动 */
@@ -1421,6 +1938,7 @@ async function boot() {
     state.baseUrl = info.base_url;
     state.dataDir = info.data_dir;
     state.imagesDir = info.images_dir;
+    state.adminKeyReady = info.admin_key_ready !== false;
     state.settings = info.settings;
   } catch (e) {
     // 浏览器预览时没有 Tauri，界面照常渲染，只是不能生图。

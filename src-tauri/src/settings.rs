@@ -26,6 +26,10 @@ pub struct Settings {
     /// 启动时是否自动检查更新。
     #[serde(default = "default_true")]
     pub auto_check_update: bool,
+    /// 每轮是否自动把上一张成品图当作参考图继续改。
+    /// 默认关闭：开启后会改走 /v1/images/edits 并上传整张 PNG，明显更慢。
+    #[serde(default)]
+    pub auto_reference: bool,
 }
 
 fn default_context_rounds() -> usize {
@@ -43,6 +47,7 @@ impl Default for Settings {
             context_rounds: default_context_rounds(),
             base_url: default_base_url(),
             auto_check_update: true,
+            auto_reference: false,
         }
     }
 }
@@ -95,5 +100,6 @@ mod tests {
         assert!(s.text_reply);
         assert_eq!(s.context_rounds, 5);
         assert!(s.auto_check_update);
+        assert!(!s.auto_reference, "自动沿用上一张图默认必须关闭（优先速度）");
     }
 }

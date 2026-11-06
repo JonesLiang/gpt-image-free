@@ -41,6 +41,9 @@ pub struct BootInfo {
     pub base_url: String,
     pub data_dir: String,
     pub images_dir: String,
+    /// 本机后端的 admin key 是否读到了。Windows 排查「连不上后端」时很有用：
+    /// 服务在跑但 key 缺失会以 401 失败，界面容易误判成没启动。
+    pub admin_key_ready: bool,
     pub settings: Settings,
 }
 
@@ -57,6 +60,7 @@ pub fn boot_info(state: tauri::State<'_, AppState>) -> BootInfo {
         base_url: settings.base_url.clone(),
         data_dir: api::data_dir().to_string_lossy().to_string(),
         images_dir: crate::storage::images_dir().to_string_lossy().to_string(),
+        admin_key_ready: !api::read_admin_key().is_empty(),
         settings,
     }
 }
@@ -98,6 +102,38 @@ pub async fn delete_accounts(
     }
     let c = client(&state);
     c.delete_accounts(&tokens).await.map_err(err)
+}
+
+/// 高级导入：把前端解析好的账号 payload 批量写进本机后端号池。
+/// payload 必须带 access_token，后端用它当主键；纯邮箱密码凭据走 OAuth 换 token。
+#[tauri::command]
+pub async fn import_accounts(
+    state: tauri::State<'_, AppState>,
+    accounts: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let c = client(&state);
+    c.add_accounts(accounts).await.map_err(err)
+}
+
+/// 为一条「邮箱/密码」凭据登记 PKCE 会话，返回可在系统浏览器打开的授权地址。
+#[tauri::command]
+pub async fn oauth_start(
+    state: tauri::State<'_, AppState>,
+    email_hint: String,
+) -> Result<serde_json::Value, String> {
+    let c = client(&state);
+    c.oauth_start(&email_hint).await.map_err(err)
+}
+
+/// 提交浏览器登录后的 callback，后端换出 token 三件套并直接落盘。
+#[tauri::command]
+pub async fn oauth_finish(
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+    callback: String,
+) -> Result<serde_json::Value, String> {
+    let c = client(&state);
+    c.oauth_finish(&session_id, &callback).await.map_err(err)
 }
 
 /// 执行一轮生图。

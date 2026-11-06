@@ -7,7 +7,8 @@
 use crate::accounts::{Account, AccountView, AccountsResponse, parse_rfc3339_millis};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:38650";
 
@@ -112,19 +113,52 @@ struct ErrorBody {
     code: Option<String>,
 }
 
+/// 回环地址必须绕过系统代理：Windows 上的 Clash / V2Ray 之类常把
+/// 127.0.0.1 也接管，表现为「本机后端未启动」。用户在设置里改成远程地址时，
+/// 仍完全跟随本机代理环境，不做任何硬编码绑定。
+fn is_loopback(base_url: &str) -> bool {
+    let s = base_url.to_ascii_lowercase();
+    s.contains("127.0.0.1") || s.contains("localhost") || s.contains("[::1]")
+}
+
+/// 复用连接池：以前每次 list_accounts / generate 都新建一个 reqwest::Client，
+/// 每次都要重新建连。这里按「回环 / 远程」缓存两个共享实例，clone 只是拿句柄。
+///
+/// 超时保持 360s 不缩短：生图本身可能跑两三分，把超时调小只会把「慢」
+/// 变成「失败」，不是优化。提速靠连接复用与少上传参考图。
+fn shared_http(base_url: &str) -> reqwest::Client {
+    static DIRECT: OnceLock<reqwest::Client> = OnceLock::new();
+    static SYSTEM: OnceLock<reqwest::Client> = OnceLock::new();
+    if is_loopback(base_url) {
+        DIRECT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(360))
+                    .no_proxy()
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            })
+            .clone()
+    } else {
+        SYSTEM
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .timeout(Duration::from_secs(360))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new())
+            })
+            .clone()
+    }
+}
+
 impl Client {
     pub fn new(base_url: Option<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(360))
-            // 不强制直连：是否走代理交给用户本地环境（系统代理 / 环境变量），
-            // 客户端不与代理设置深度绑定。
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let base = base_url
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         Self {
-            http,
-            base_url: base_url
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            http: shared_http(&base),
+            base_url: base,
             admin_key: read_admin_key(),
         }
     }
@@ -174,6 +208,17 @@ impl Client {
         Ok(text)
     }
 
+    async fn request_json(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, ApiError> {
+        let text = self.request(method, path, body).await?;
+        serde_json::from_str(&text)
+            .map_err(|e| ApiError::Other(format!("响应解析失败：{e}")))
+    }
+
     /// 拉取全部账号。返回原始账号，调用方再算展示视图。
     pub async fn list_accounts(&self) -> Result<Vec<Account>, ApiError> {
         let text = self
@@ -216,6 +261,48 @@ impl Client {
         self.request(reqwest::Method::DELETE, "/api/accounts", Some(body))
             .await?;
         Ok(())
+    }
+
+    /// 批量入池。后端以 access_token 为账号主键，只有带 access_token 的
+    /// payload 能落盘；纯「邮箱 / 密码 / 2FA」凭据不能直接入池，必须先走
+    /// oauth_start + oauth_finish 换出 token 三件套。
+    pub async fn add_accounts(
+        &self,
+        accounts: Vec<serde_json::Value>,
+    ) -> Result<serde_json::Value, ApiError> {
+        if accounts.is_empty() {
+            return Ok(serde_json::json!({ "added": 0, "skipped": 0 }));
+        }
+        self.request_json(
+            reqwest::Method::POST,
+            "/api/accounts",
+            Some(serde_json::json!({ "accounts": accounts })),
+        )
+        .await
+    }
+
+    /// 登记一次 PKCE 会话，返回 authorize_url 让用户在系统浏览器里登录。
+    pub async fn oauth_start(&self, email_hint: &str) -> Result<serde_json::Value, ApiError> {
+        self.request_json(
+            reqwest::Method::POST,
+            "/api/accounts/oauth/start",
+            Some(serde_json::json!({ "email_hint": email_hint })),
+        )
+        .await
+    }
+
+    /// 用登录后的 callback URL（或裸 code）换 token 并直接落进号池。
+    pub async fn oauth_finish(
+        &self,
+        session_id: &str,
+        callback: &str,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.request_json(
+            reqwest::Method::POST,
+            "/api/accounts/oauth/finish",
+            Some(serde_json::json!({ "session_id": session_id, "callback": callback })),
+        )
+        .await
     }
 
     /// 生图 / 改图。
@@ -366,5 +453,21 @@ mod tests {
     fn empty_status_shows_unknown() {
         let views = to_views(&[sample("", 3, 3)], 0);
         assert_eq!(views[0].status, "未知");
+    }
+
+    #[test]
+    fn only_loopback_bypasses_system_proxy() {
+        assert!(is_loopback("http://127.0.0.1:38650"));
+        assert!(is_loopback("http://localhost:38650"));
+        assert!(is_loopback("http://[::1]:38650"));
+        assert!(!is_loopback("https://api.example.com"));
+    }
+
+    #[test]
+    fn shared_http_reuses_the_same_pool() {
+        // 两次构造应拿到同一个连接池句柄，而不是各自新建 Client。
+        let a = Client::new(None);
+        let b = Client::new(Some("http://127.0.0.1:38650".into()));
+        assert_eq!(a.base_url(), b.base_url());
     }
 }
