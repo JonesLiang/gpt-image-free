@@ -1,14 +1,16 @@
 /* =========================================================================
    GPT Image Free — 前端应用
    纯原生 JS，无构建步骤：ui/ 直接作为 Tauri 的 frontendDist。
-   设计原则：首页干净、留白优先；所有次要功能收进左下角头像菜单。
+
+   界面形态：ChatGPT 式对话（左侧会话列表 + 消息流 + 常驻输入框）。
+   关键约定：输入框 DOM 一旦创建就不随状态刷新重建，否则中文输入法
+   组合、光标位置和焦点都会被打断。所有刷新只更新消息区 / 侧栏 / 按钮状态。
    ========================================================================= */
 
 const invoke = (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) || null;
 
 /* ------------------------------------------------------------------ 工具 */
 
-/** 毫秒差 → 「7 小时 23 分」这类中文倒计时。 */
 function humanize(ms) {
   if (ms === null || ms === undefined || Number.isNaN(ms)) return "—";
   if (ms <= 0) return "已到期";
@@ -21,7 +23,6 @@ function humanize(ms) {
   return `${Math.max(1, m)} 分钟`;
 }
 
-/** UTC 时间戳 → 本地「今天 17:09」/「明天 09:30」/「11-08 02:00」。 */
 function localWhen(iso, nowMs) {
   if (!iso) return "—";
   const t = parseIsoUtc(iso);
@@ -55,6 +56,10 @@ const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
 const esc = (s) =>
   String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+function uid(prefix) {
+  return (prefix || "t") + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
 function el(tag, attrs, children) {
   const node = document.createElement(tag);
   if (attrs) {
@@ -84,6 +89,14 @@ async function call(command, args) {
   return invoke(command, args);
 }
 
+function clock(ms) {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  const same = d.toDateString() === new Date().toDateString();
+  return same ? `${pad(d.getHours())}:${pad(d.getMinutes())}` : `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
 /* ------------------------------------------------------------------ 状态 */
 
 const state = {
@@ -98,37 +111,43 @@ const state = {
   loadingAccounts: false,
   settings: { text_reply: false, context_rounds: 5, base_url: "", auto_check_update: true },
   update: null,
-  // 会话
-  turns: [],
   boundToken: null,
+  accountPopOpen: false,
+  // 会话
+  conversations: [],
+  conversation: null,
+  // 输入
   input: "",
+  reference: null,
   busy: false,
-  error: null,
-  // 首页画廊：生成过的图
-  gallery: [],
-  selected: new Set(),
+  pendingInject: false,
+  // 更新
+  updateState: null,
+  // DOM 缓存
+  dom: null,
+  stageRoute: null,
 };
 
 let tickTimer = null;
+let genTimer = null;
+let saveTimer = null;
+let autoUpdateTimer = null;
+let composing = false;
 
 /* ------------------------------------------------------------------ 账号 */
 
-/** 排序：可用号按额度降序在前；限流/冻结一律沉底。 */
 function sortedAccounts() {
-  return state.accounts
-    .slice()
-    .sort((a, b) => {
-      if (a.blocked !== b.blocked) return a.blocked ? 1 : -1;
-      if (a.usable !== b.usable) return a.usable ? -1 : 1;
-      return (b.quota || 0) - (a.quota || 0);
-    });
+  return state.accounts.slice().sort((a, b) => {
+    if (a.blocked !== b.blocked) return a.blocked ? 1 : -1;
+    if (a.usable !== b.usable) return a.usable ? -1 : 1;
+    return (b.quota || 0) - (a.quota || 0);
+  });
 }
 
 function accountByToken(token) {
   return state.accounts.find((a) => a.access_token === token) || null;
 }
 
-/** 当前绑定账号：绑定失效时回退到「额度最多的可用号」。 */
 function activeAccount() {
   const bound = accountByToken(state.boundToken);
   if (bound) return bound;
@@ -141,9 +160,7 @@ function pickBestAccount() {
 
 async function loadAccounts(force) {
   state.loadingAccounts = true;
-  renderIfRoute("home");
-  renderIfRoute("overview");
-  renderIfRoute("pool");
+  render();
   try {
     state.accounts = await call(force ? "refresh_accounts" : "list_accounts");
     state.online = true;
@@ -153,9 +170,8 @@ async function loadAccounts(force) {
     }
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
-    if (msg.includes("后端未连接")) {
-      state.online = false;
-    } else {
+    if (msg.includes("后端未连接")) state.online = false;
+    else {
       state.online = true;
       toast(msg, true);
     }
@@ -168,7 +184,7 @@ async function loadAccounts(force) {
 /* ------------------------------------------------------------------ 路由 */
 
 const ROUTES = {
-  home: ["image", "首页"],
+  home: ["◈", "对话"],
   overview: ["◔", "剩余额度"],
   pool: ["▤", "号池管理"],
   api: ["⌘", "API 接入"],
@@ -179,58 +195,52 @@ const ROUTES = {
 function setRoute(name) {
   state.route = name;
   closeMenu();
+  state.accountPopOpen = false;
   render();
   const stage = $("#stage");
   if (stage) stage.scrollTop = 0;
-}
-
-function renderIfRoute(name) {
-  if (state.route === name) render();
 }
 
 function render() {
   renderRail();
   const stage = $("#stage");
   if (!stage) return;
-  stage.innerHTML = "";
-  switch (state.route) {
-    case "home":
-      renderHome(stage);
-      break;
-    case "overview":
-      renderOverview(stage);
-      break;
-    case "pool":
-      renderPool(stage);
-      break;
-    case "api":
-      renderApi(stage);
-      break;
-    case "import":
-      renderImport(stage);
-      break;
-    case "settings":
-      renderSettings(stage);
-      break;
+
+  if (state.route !== "home") {
+    // 设置类页面没有常驻输入框，全量重建最省心。
+    stage.innerHTML = "";
+    state.dom = null;
+    state.stageRoute = state.route;
+    switch (state.route) {
+      case "overview": renderOverview(stage); break;
+      case "pool": renderPool(stage); break;
+      case "api": renderApi(stage); break;
+      case "import": renderImport(stage); break;
+      case "settings": renderSettings(stage); break;
+    }
+  } else {
+    if (state.stageRoute !== "home" || !state.dom || !state.dom.root.isConnected) {
+      stage.innerHTML = "";
+      buildHome(stage);
+      state.stageRoute = "home";
+    }
+    refreshHome();
   }
+  renderUpdateBar();
 }
 
 function renderRail() {
   const nav = $("#railNav");
   if (!nav) return;
   nav.innerHTML = "";
-  // 窄栏只放入口图标；具体功能都在头像菜单里，避免导航膨胀。
-  for (const key of ["home"]) {
-    const active = state.route === key;
-    nav.appendChild(
-      el("button", {
-        class: "rail-btn" + (active ? " active" : ""),
-        title: ROUTES[key][1],
-        text: "◈",
-        onclick: () => setRoute(key),
-      })
-    );
-  }
+  nav.appendChild(
+    el("button", {
+      class: "rail-btn" + (state.route === "home" ? " active" : ""),
+      title: ROUTES.home[1],
+      text: "◈",
+      onclick: () => setRoute("home"),
+    })
+  );
   const chip = $("#versionBtn");
   if (chip) {
     chip.textContent = "v" + state.version;
@@ -244,130 +254,522 @@ function renderRail() {
   $("#menuPlan").textContent = state.online === false ? "后端未连接" : "本地客户端";
 }
 
-/* ------------------------------------------------------------------ 首页 */
+/* ------------------------------------------------------------------ 首页骨架 */
 
-function renderHome(stage) {
-  const wrap = el("div", { class: "chat" });
+function buildHome(stage) {
+  const root = el("div", { class: "home" });
 
-  // ---- 头部
-  const head = el("div", { class: "page", style: "padding-bottom:0" });
-  head.appendChild(el("h1", { class: "page-title", text: "图像" }));
+  const sidebar = el("aside", { class: "session-sidebar" });
+  sidebar.appendChild(
+    el("div", { class: "sidebar-head" }, [
+      el("button", { class: "new-chat", text: "+ 新建对话", onclick: () => newConversation() }),
+      el("div", { class: "sidebar-label", text: "历史会话" }),
+    ])
+  );
+  const list = el("div", { class: "session-list" });
+  sidebar.appendChild(list);
 
-  const tabs = el("div", { class: "gallery-tabs" }, [
-    el("button", { class: "tab active", text: "热门" }),
-    el("button", { class: "tab", text: "模板", disabled: "disabled", title: "即将推出" }),
+  const main = el("div", { class: "chat-main" });
+  const title = el("div", { class: "chat-title", text: "图像" });
+  const sub = el("div", { class: "chat-sub", text: "描述画面，或上传参考图继续修改" });
+  const offline = el("div", { class: "notice", hidden: true });
+  const head = el("div", { class: "chat-head" }, [
+    el("div", { class: "chat-head-copy" }, [title, sub]),
+    el("div", { class: "chat-head-actions" }, [offline]),
   ]);
-  head.appendChild(tabs);
 
-  if (state.online === false) {
-    head.appendChild(
-      el("div", { class: "notice", html: "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务后点击刷新。" })
-    );
-    const refresh = el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) });
-    head.lastChild.appendChild(refresh);
-  }
-  wrap.appendChild(head);
-
-  // ---- 画廊
   const scroll = el("div", { class: "chat-scroll" });
-  const inner = el("div", { class: "page", style: "padding-top:20px" });
-
-  if (state.gallery.length === 0) {
-    inner.appendChild(
-      el("div", {
-        class: "empty",
-        html: "<strong>还没有生成过图片</strong>在下面的输入框里描述你想要的画面，第一张图会出现在这里。",
-      })
-    );
-  } else {
-    const grid = el("div", { class: "gallery" });
-    state.gallery.forEach((g) => {
-      grid.appendChild(
-        el("div", { class: "tile", onclick: () => openLightbox(g.image) }, [
-          el("img", { src: g.image, alt: g.prompt }),
-          el("div", { class: "tile-label", text: g.prompt }),
-        ])
-      );
-    });
-    inner.appendChild(grid);
-  }
+  const inner = el("div", { class: "chat-inner" });
   scroll.appendChild(inner);
-  wrap.appendChild(scroll);
 
-  // ---- 输入区
-  wrap.appendChild(buildComposer());
-  stage.appendChild(wrap);
+  const composer = buildComposer();
+  main.appendChild(head);
+  main.appendChild(scroll);
+  main.appendChild(composer.wrap);
+
+  root.appendChild(sidebar);
+  root.appendChild(main);
+  stage.appendChild(root);
+
+  scroll.addEventListener("scroll", () => {
+    if (!state.dom) return;
+    state.dom.atBottom = scroll.scrollTop + scroll.clientHeight >= scroll.scrollHeight - 48;
+  });
+
+  state.dom = Object.assign({ root, sidebar, list, head, title, sub, offline, scroll, inner, msgSig: "", listSig: "", atBottom: true }, composer);
+  autoGrow();
+  syncSendBtn();
+  return state.dom;
 }
 
-/** Codex 式输入框：左侧 +、中间多行输入、右侧账号选择与发送。 */
-function buildComposer() {
-  const acct = activeAccount();
-  const quota = acct ? acct.quota : 0;
-  const dotClass = !acct ? "bad" : acct.blocked ? "warn" : "ok";
+function refreshHome() {
+  const d = state.dom;
+  if (!d) return;
+  renderSidebar();
+  renderMessages();
+  updateComposer();
+}
 
-  const pill = el("button", { class: "model-pill", title: "选择账号", onclick: toggleAccountPop }, [
-    el("span", { class: "dot " + dotClass }),
-    el("span", { class: "name", text: acct ? acct.name : "无可用账号" }),
-    el("span", { class: "acct-quota " + (quota <= 0 ? "zero" : quota <= 3 ? "low" : ""), text: String(quota) }),
-  ]);
+/* ------------------------------------------------------------------ 会话列表 */
 
-  const textarea = el("textarea", {
-    placeholder: "描述你想生成的图像…",
-    rows: "1",
+function renderSidebar() {
+  const d = state.dom;
+  if (!d) return;
+  const sig = state.conversations.map((m) => `${m.id}:${m.title}:${m.turns}`).join("|") + "|" + (state.conversation && state.conversation.id);
+  if (sig === d.listSig) return;
+  d.listSig = sig;
+  d.list.innerHTML = "";
+  if (state.conversations.length === 0) {
+    d.list.appendChild(el("div", { class: "session-empty", text: "还没有历史会话" }));
+  }
+  state.conversations.forEach((m) => {
+    const active = state.conversation && state.conversation.id === m.id;
+    const item = el("div", {
+      class: "session-item" + (active ? " active" : ""),
+      role: "button",
+      tabindex: "0",
+      title: m.title,
+      onclick: () => switchConversation(m.id),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); switchConversation(m.id); } },
+    }, [
+      el("span", { class: "session-icon", text: "◇" }),
+      el("span", { class: "session-name", text: m.title || "新会话" }),
+      el("button", {
+        class: "session-del",
+        title: "删除会话",
+        text: "×",
+        onclick: (e) => { e.stopPropagation(); deleteConversation(m.id); },
+      }),
+    ]);
+    d.list.appendChild(item);
   });
+}
+
+/* ------------------------------------------------------------------ 消息流 */
+
+function renderMessages() {
+  const d = state.dom;
+  if (!d || !state.conversation) return;
+  const turns = state.conversation.turns;
+  const sig = turns
+    .map((t) => [t.id, t.status, (t.image || "").length, (t.text || "").length, (t.error || "")].join("|"))
+    .join("~") + "|" + state.online;
+  if (sig === d.msgSig) return;
+  d.msgSig = sig;
+  d.inner.innerHTML = "";
+
+  if (turns.length === 0) {
+    d.inner.appendChild(buildEmptyState());
+  } else {
+    turns.forEach((t) => {
+      d.inner.appendChild(renderUserTurn(t));
+      d.inner.appendChild(renderAiTurn(t));
+    });
+  }
+  syncGenAnimation();
+  scrollToBottom(true);
+}
+
+function buildEmptyState() {
+  const examples = [
+    "一只橘猫坐在雨后的木窗台，电影感侧光",
+    "极简产品海报，米白背景，柔和长阴影",
+    "水墨山水，大面积留白，远处一叶扁舟",
+    "赛博朋克城市夜景，湿地面上的霓虹倒影",
+  ];
+  const box = el("div", { class: "hero" }, [
+    el("div", { class: "hero-mark" }),
+    el("h1", { text: "想画点什么？" }),
+    el("p", { text: "描述画面即可生成；带 + 上传参考图，可以基于图片继续修改。" }),
+  ]);
+  const chips = el("div", { class: "hero-chips" });
+  examples.forEach((text) => {
+    chips.appendChild(el("button", { class: "hero-chip", text, onclick: () => fillComposer(text) }));
+  });
+  box.appendChild(chips);
+  if (state.online === false) {
+    box.appendChild(el("div", { class: "hero-warn", text: "本机后端未启动，生图暂不可用" }));
+  }
+  return box;
+}
+
+function renderUserTurn(t) {
+  const box = el("div", { class: "msg-user" });
+  if (t.reference) {
+    box.appendChild(
+      el("img", {
+        class: "msg-ref",
+        src: t.reference,
+        title: "本轮参考图（点击放大）",
+        onclick: () => openLightbox(t.reference),
+      })
+    );
+  }
+  box.appendChild(el("div", { class: "msg-user-text", text: t.prompt }));
+  return box;
+}
+
+function renderAiTurn(t) {
+  const wrap = el("div", { class: "msg-ai" });
+  if (t.status === "running") {
+    wrap.appendChild(
+      el("div", { class: "gen-card" }, [
+        el("div", { class: "skel gen-skel" }),
+        el("div", { class: "gen-row" }, [
+          el("div", { class: "thinking" }, [el("i"), el("i"), el("i")]),
+          el("span", { class: "gen-status", text: "正在理解你的描述…" }),
+        ]),
+      ])
+    );
+    return wrap;
+  }
+  if (t.status === "error") {
+    wrap.appendChild(el("div", { class: "msg-error" }, [el("span", { text: "生成失败" }), el("span", { text: t.error || "未知错误" })]));
+    wrap.appendChild(el("button", { class: "btn retry-btn", text: "重新编辑这条提示词", onclick: () => retryTurn(t.id) }));
+    return wrap;
+  }
+  if (t.image) {
+    wrap.appendChild(
+      el("div", { class: "msg-img", title: "点击放大", onclick: () => openLightbox(t.image) }, [
+        el("img", { src: t.image, alt: t.prompt }),
+      ])
+    );
+    wrap.appendChild(
+      el("div", { class: "msg-actions" }, [
+        el("button", { class: "btn", text: "放大查看", onclick: () => openLightbox(t.image) }),
+        el("a", { class: "btn", href: t.image, download: `image-${t.id}.png`, text: "下载" }),
+      ])
+    );
+  }
+  if (t.text) wrap.appendChild(el("div", { class: "msg-text", text: t.text }));
+  const bits = [t.account || "本地", clock(t.createdAt)];
+  if (t.injected) bits.push("已注入上下文");
+  if (t.reference) bits.push("自定义参考图");
+  else if (t.refRound) bits.push(`参考第 ${t.refRound} 轮`);
+  wrap.appendChild(el("div", { class: "msg-meta", text: bits.join(" · ") }));
+  return wrap;
+}
+
+function syncGenAnimation() {
+  const running = state.conversation && state.conversation.turns.some((t) => t.status === "running");
+  if (running && !genTimer) {
+    const texts = ["正在理解你的描述…", "正在绘制画面…", "正在收尾，马上就好…", "还在生成，请稍等…"];
+    let i = 0;
+    genTimer = setInterval(() => {
+      i = (i + 1) % texts.length;
+      const node = $(".gen-status", state.dom && state.dom.inner);
+      if (node) node.textContent = texts[i];
+    }, 4500);
+  } else if (!running && genTimer) {
+    clearInterval(genTimer);
+    genTimer = null;
+  }
+}
+
+function scrollToBottom(force) {
+  const d = state.dom;
+  if (!d) return;
+  if (force || d.atBottom !== false) {
+    requestAnimationFrame(() => { d.scroll.scrollTop = d.scroll.scrollHeight; });
+  }
+}
+
+/* ------------------------------------------------------------------ 会话持久化 */
+
+function normalizeConversation(raw) {
+  const c = raw || {};
+  const conv = {
+    id: c.id || uid("c"),
+    title: c.title || "新会话",
+    createdAt: c.createdAt || Date.now(),
+    updatedAt: c.updatedAt || Date.now(),
+    turns: Array.isArray(c.turns) ? c.turns : [],
+  };
+  conv.turns.forEach((t) => {
+    if (t.status === "running" || t.status === "pending") {
+      t.status = "error";
+      t.error = "上次生成未完成，可重新编辑后重发";
+    }
+  });
+  return conv;
+}
+
+async function refreshConversations() {
+  try {
+    state.conversations = (await call("list_conversations")) || [];
+    if (state.dom) state.dom.listSig = "";
+    if (state.route === "home") render();
+    return state.conversations;
+  } catch (e) {
+    return state.conversations;
+  }
+}
+
+function persistConversation(immediate) {
+  if (!state.conversation) return Promise.resolve();
+  state.conversation.updatedAt = Date.now();
+  const snapshot = JSON.parse(JSON.stringify(state.conversation));
+  const run = async () => {
+    try {
+      await call("save_conversation", { conversation: snapshot });
+      await refreshConversations();
+    } catch (e) {
+      toast("会话保存失败：" + String(e && e.message ? e.message : e), true);
+    }
+  };
+  clearTimeout(saveTimer);
+  if (immediate) return run();
+  saveTimer = setTimeout(run, 500);
+  return Promise.resolve();
+}
+
+async function newConversation() {
+  if (state.conversation && state.conversation.turns.length === 0) {
+    focusComposer();
+    return;
+  }
+  const now = Date.now();
+  state.conversation = { id: uid("c"), title: "新会话", createdAt: now, updatedAt: now, turns: [] };
+  state.input = "";
+  state.reference = null;
+  state.busy = false;
+  state.pendingInject = false;
+  state.accountPopOpen = false;
+  if (state.dom) {
+    state.dom.textarea.value = "";
+    autoGrow();
+  }
+  closeMenu();
+  if (state.route !== "home") setRoute("home");
+  else render();
+  await persistConversation(true);
+  focusComposer();
+}
+
+async function switchConversation(id) {
+  if (state.conversation && state.conversation.id === id) return;
+  try {
+    const data = await call("load_conversation", { id });
+    state.conversation = normalizeConversation(data || { id, turns: [] });
+    state.input = "";
+    state.reference = null;
+    state.busy = false;
+    state.accountPopOpen = false;
+    if (state.dom) {
+      state.dom.textarea.value = "";
+      state.dom.msgSig = "";
+      autoGrow();
+    }
+    closeMenu();
+    if (state.route !== "home") setRoute("home");
+    else render();
+    scrollToBottom(true);
+  } catch (e) {
+    toast(String(e && e.message ? e.message : e), true);
+  }
+}
+
+async function deleteConversation(id) {
+  try {
+    await call("delete_conversation", { id });
+    const list = await refreshConversations();
+    if (state.conversation && state.conversation.id === id) {
+      if (list.length) await switchConversation(list[0].id);
+      else await newConversation();
+    } else if (state.route === "home") render();
+  } catch (e) {
+    toast(String(e && e.message ? e.message : e), true);
+  }
+}
+
+function retryTurn(id) {
+  const t = state.conversation && state.conversation.turns.find((x) => x.id === id);
+  if (!t) return;
+  state.conversation.turns = state.conversation.turns.filter((x) => x.id !== id);
+  state.input = t.prompt;
+  state.reference = t.reference ? { name: "参考图", dataUrl: t.reference } : null;
+  if (state.dom) {
+    state.dom.textarea.value = state.input;
+    state.dom.msgSig = "";
+  }
+  render();
+  focusComposer();
+}
+
+/* ------------------------------------------------------------------ 输入框 */
+
+function buildComposer() {
+  const wrap = el("div", { class: "composer-wrap" });
+
+  const refChip = el("div", { class: "reference-chip", hidden: true });
+  const composer = el("div", { class: "composer" });
+
+  const refInput = el("input", { type: "file", accept: "image/*", style: "display:none" });
+  refInput.addEventListener("change", onReferencePicked);
+
+  const plus = el("button", {
+    class: "composer-plus",
+    title: "选择参考图（可基于图片继续修改）",
+    text: "+",
+    onclick: () => refInput.click(),
+  });
+
+  const textarea = el("textarea", { placeholder: "描述你想生成的图像…", rows: "1" });
   textarea.value = state.input;
+  textarea.addEventListener("compositionstart", () => { composing = true; });
+  textarea.addEventListener("compositionend", () => { composing = false; syncSendBtn(); });
   textarea.addEventListener("input", () => {
     state.input = textarea.value;
-    textarea.style.height = "auto";
-    textarea.style.height = Math.min(textarea.scrollHeight, 180) + "px";
-    sendBtn.disabled = !canSend();
+    autoGrow();
+    syncSendBtn();
   });
   textarea.addEventListener("keydown", (e) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+    // 中文输入法选字时按下的 Enter 不能当发送。
+    if (e.isComposing || composing || e.keyCode === 229) return;
+    const cmdEnter = (e.metaKey || e.ctrlKey) && e.key === "Enter";
+    const plainEnter = e.key === "Enter" && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey;
+    if (cmdEnter || plainEnter) {
       e.preventDefault();
       sendPrompt();
     }
   });
 
-  const sendBtn = el("button", {
-    class: "composer-send",
-    title: "生成（⌘/Ctrl + Enter）",
-    text: "↑",
-    disabled: canSend() ? null : "disabled",
-    onclick: sendPrompt,
-  });
+  const pill = el("button", { class: "model-pill", title: "选择账号", onclick: toggleAccountPop });
+  const sendBtn = el("button", { class: "composer-send", title: "生成（Enter）", text: "↑", onclick: sendPrompt });
+  const right = el("div", { class: "composer-right" }, [pill, sendBtn]);
+  composer.appendChild(plus);
+  composer.appendChild(refInput);
+  composer.appendChild(textarea);
+  composer.appendChild(right);
 
-  const wrap = el("div", { class: "composer-wrap" });
-  const composer = el("div", { class: "composer" }, [
-    el("button", { class: "composer-plus", title: "上传参考图（暂未开放）", text: "+", disabled: "disabled" }),
-    textarea,
-    el("div", { class: "composer-right" }, [pill, sendBtn]),
-  ]);
+  const hint = el("div", { class: "composer-hint", text: "Enter 发送 · Shift+Enter 换行 · + 添加参考图" });
+  const popHolder = el("div", { class: "pop-holder" });
+  wrap.appendChild(refChip);
   wrap.appendChild(composer);
+  wrap.appendChild(hint);
+  wrap.appendChild(popHolder);
 
-  // 账号下拉挂在这里，位置相对 wrap 固定
-  if (state.accountPopOpen) wrap.appendChild(buildAccountPop());
-  requestAnimationFrame(() => {
-    textarea.style.height = "auto";
-    textarea.style.height = Math.min(textarea.scrollHeight, 180) + "px";
-  });
-  return wrap;
+  return { wrap, refChip, refInput, plus, textarea, pill, sendBtn, composer, hint, popHolder };
+}
+
+function autoGrow() {
+  const d = state.dom;
+  if (!d) return;
+  d.textarea.style.height = "auto";
+  d.textarea.style.height = Math.min(d.textarea.scrollHeight, 180) + "px";
+}
+
+function focusComposer() {
+  const d = state.dom;
+  if (!d) return;
+  d.textarea.focus();
+  const end = d.textarea.value.length;
+  d.textarea.setSelectionRange(end, end);
+}
+
+function fillComposer(text) {
+  state.input = text;
+  if (state.dom) {
+    state.dom.textarea.value = text;
+    autoGrow();
+  }
+  syncSendBtn();
+  focusComposer();
+}
+
+function syncSendBtn() {
+  const d = state.dom;
+  if (!d) return;
+  d.sendBtn.disabled = !canSend();
+}
+
+function renderReferenceChip() {
+  const d = state.dom;
+  if (!d) return;
+  const chip = d.refChip;
+  chip.innerHTML = "";
+  if (!state.reference) {
+    chip.hidden = true;
+    return;
+  }
+  chip.hidden = false;
+  chip.appendChild(el("img", { class: "reference-thumb", src: state.reference.dataUrl, title: state.reference.name }));
+  chip.appendChild(el("span", { class: "reference-name", text: state.reference.name }));
+  chip.appendChild(el("span", { class: "reference-tag", text: "参考图" }));
+  chip.appendChild(el("button", { class: "reference-remove", title: "移除参考图", text: "×", onclick: () => {
+    state.reference = null;
+    renderReferenceChip();
+    syncSendBtn();
+  } }));
+}
+
+function onReferencePicked(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onerror = () => toast("文件读取失败", true);
+  reader.onload = () => {
+    const img = new Image();
+    img.onerror = () => toast("这不是一张可读取的图片", true);
+    img.onload = () => {
+      // 统一转成 PNG（后端 edits 通道按 image/png 组装），顺手压到 2048px 以内。
+      const max = 2048;
+      const scale = Math.min(1, max / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext("2d").drawImage(img, 0, 0, canvas.width, canvas.height);
+      state.reference = { name: file.name, dataUrl: canvas.toDataURL("image/png") };
+      renderReferenceChip();
+      syncSendBtn();
+      focusComposer();
+    };
+    img.src = String(reader.result);
+  };
+  reader.readAsDataURL(file);
+  e.target.value = "";
+}
+
+function updateComposer() {
+  const d = state.dom;
+  if (!d) return;
+  const acct = activeAccount();
+  d.pill.innerHTML = "";
+  const dotClass = !acct ? "bad" : acct.blocked ? "warn" : "ok";
+  d.pill.appendChild(el("span", { class: "dot " + dotClass }));
+  d.pill.appendChild(el("span", { class: "name", text: acct ? acct.name : "无可用账号" }));
+  d.pill.appendChild(
+    el("span", { class: "acct-quota " + ((acct && acct.quota <= 0) ? "zero" : (acct && acct.quota <= 3) ? "low" : ""), text: String(acct ? acct.quota : 0) })
+  );
+  renderReferenceChip();
+  syncSendBtn();
+
+  const conv = state.conversation;
+  d.title.textContent = conv ? conv.title : "新会话";
+  d.sub.textContent = conv && conv.turns.length ? `共 ${conv.turns.length} 轮 · 对话会自动保存在本机` : "描述画面，或上传参考图继续修改";
+
+  d.offline.hidden = state.online !== false;
+  if (state.online === false) {
+    d.offline.innerHTML = "";
+    d.offline.appendChild(el("span", { text: "本机后端未启动，生图不可用。请先启动 chatgpt2api 服务。" }));
+    d.offline.appendChild(el("button", { class: "btn", text: "重新连接", onclick: () => loadAccounts(false) }));
+  }
+
+  d.popHolder.innerHTML = "";
+  if (state.accountPopOpen) d.popHolder.appendChild(buildAccountPop());
 }
 
 function canSend() {
-  if (state.busy) return false;
-  if (!state.input.trim()) return false;
+  if (state.busy || !state.conversation) return false;
+  if (!state.input.trim() && !state.reference) return false;
   const acct = activeAccount();
-  if (!acct || !acct.usable) return false;
-  return true;
+  return !!acct && !!acct.usable;
 }
 
 /** 账号下拉：展示名称 / 剩余额度 / 下次刷新；不可用的排到底部并置灰。 */
 function buildAccountPop() {
   const pop = el("div", { class: "account-pop" });
-  const active = activeAccount();
   const list = sortedAccounts();
-
   if (state.loadingAccounts && list.length === 0) {
     pop.appendChild(el("div", { class: "pop-title", text: "加载中…" }));
     return pop;
@@ -376,10 +778,6 @@ function buildAccountPop() {
     pop.appendChild(el("div", { class: "pop-title", text: "没有账号，请在头像菜单 → 号池管理中导入" }));
     return pop;
   }
-
-  const usable = list.filter((a) => a.usable);
-  const blocked = list.filter((a) => !a.usable);
-
   const addGroup = (title, items) => {
     if (items.length === 0) return;
     pop.appendChild(el("div", { class: "pop-title", text: title }));
@@ -390,32 +788,26 @@ function buildAccountPop() {
         el("span", { text: "下次刷新 " + countdown }),
         a.blocked ? el("span", { text: a.status }) : null,
       ]);
-      const row = el(
-        "button",
-        {
+      pop.appendChild(
+        el("button", {
           class: "acct-row" + (a.access_token === state.boundToken ? " selected" : "") + (a.usable ? "" : " disabled"),
           disabled: a.usable ? null : "disabled",
           onclick: () => {
             state.boundToken = a.access_token;
             state.accountPopOpen = false;
+            state.pendingInject = true;
             toast("已切换到 " + a.name);
             render();
           },
-        },
-        [
+        }, [
           el("div", { class: "acct-main" }, [el("div", { class: "acct-name", text: a.name }), meta]),
-          el("div", {
-            class: "acct-quota " + (a.quota <= 0 ? "zero" : a.quota <= 3 ? "low" : ""),
-            text: String(a.quota),
-          }),
-        ]
+          el("div", { class: "acct-quota " + (a.quota <= 0 ? "zero" : a.quota <= 3 ? "low" : ""), text: String(a.quota) }),
+        ])
       );
-      pop.appendChild(row);
     });
   };
-
-  addGroup("可用账号", usable);
-  addGroup("不可用（限流 / 冻结）", blocked);
+  addGroup("可用账号", list.filter((a) => a.usable));
+  addGroup("不可用（限流 / 冻结）", list.filter((a) => !a.usable));
   return pop;
 }
 
@@ -426,40 +818,80 @@ function toggleAccountPop() {
 
 /* ------------------------------------------------------------------ 生图 */
 
+function stripDataUrl(s) {
+  const i = s.indexOf(",");
+  return s.startsWith("data:") && i >= 0 ? s.slice(i + 1) : s;
+}
+
+function lastDoneImage() {
+  if (!state.conversation) return null;
+  for (let i = state.conversation.turns.length - 1; i >= 0; i--) {
+    const t = state.conversation.turns[i];
+    if (t.status === "done" && t.image) return t;
+  }
+  return null;
+}
+
+function composeInjectedPrompt(turns, current, limit) {
+  const n = Math.max(1, limit || 5);
+  const kept = turns.slice(Math.max(0, turns.length - n));
+  if (kept.length === 0) return current.trim();
+  const start = turns.length - kept.length;
+  const ctx = kept.map((t, i) => `第 ${start + i + 1} 轮：${t.prompt.trim()}`).join("\n");
+  return `【这是一个续接的会话，之前的内容如下】\n${ctx}\n\n【本轮要求】\n${current.trim()}`;
+}
+
 async function sendPrompt() {
   if (!canSend()) return;
   const acct = activeAccount();
   if (!acct) return toast("没有可用账号", true);
 
-  const prompt = state.input.trim();
-  state.input = "";
-  state.busy = true;
-  state.error = null;
-
+  const prompt = state.input.trim() || "请根据参考图生成相似风格的图片";
+  const refDataUrl = state.reference ? state.reference.dataUrl : null;
+  const prev = lastDoneImage();
   const turn = {
-    id: "t" + Date.now(),
+    id: uid(),
     prompt,
     status: "running",
     image: null,
     text: null,
     error: null,
     account: acct.name,
+    reference: refDataUrl,
+    refRound: !refDataUrl && prev ? state.conversation.turns.indexOf(prev) + 1 : 0,
+    injected: false,
+    createdAt: Date.now(),
   };
-  state.turns.push(turn);
+  state.conversation.turns.push(turn);
+  if (state.conversation.title === "新会话") {
+    state.conversation.title = prompt.length > 18 ? prompt.slice(0, 18) + "…" : prompt;
+  }
+  state.input = "";
+  state.reference = null;
+  state.busy = true;
 
-  // 上一张成功的图作为参考图 → 走改图通道，保持画面连贯。
-  const prev = lastDoneImage();
-  const reference = prev ? stripDataUrl(prev.image) : null;
+  const d = state.dom;
+  if (d) {
+    d.textarea.value = "";
+    d.msgSig = "";
+    autoGrow();
+    renderReferenceChip();
+  }
+  persistConversation();
+  render();
+  focusComposer();
 
-  // 换号后第一轮注入上下文：让新账号看到之前的内容。
+  // 手动上传的参考图优先；否则沿用上一张成功的图继续改（保持画面连贯）。
+  let reference = refDataUrl ? stripDataUrl(refDataUrl) : null;
+  if (!reference && prev) reference = stripDataUrl(prev.image);
+
   let finalPrompt = prompt;
-  if (state.pendingInject && state.turns.length > 1) {
-    finalPrompt = composeInjectedPrompt(state.turns.slice(0, -1), prompt, state.settings.context_rounds);
+  if (state.pendingInject && state.conversation.turns.length > 1) {
+    finalPrompt = composeInjectedPrompt(state.conversation.turns.slice(0, -1), prompt, state.settings.context_rounds);
     turn.injected = true;
     state.pendingInject = false;
   }
 
-  render();
   try {
     const result = await call("generate", {
       prompt: finalPrompt,
@@ -470,47 +902,81 @@ async function sendPrompt() {
     turn.status = "done";
     turn.image = result.image;
     turn.text = result.text || null;
-    state.gallery.unshift({ image: result.image, prompt, at: Date.now() });
-    // 额度变了，重新拉一次
+    turn.path = result.path || null;
     loadAccounts(false);
   } catch (e) {
     turn.status = "error";
     turn.error = String(e && e.message ? e.message : e);
   } finally {
     state.busy = false;
+    if (d) d.msgSig = "";
+    persistConversation(true);
     render();
+    syncSendBtn();
   }
 }
 
-function stripDataUrl(s) {
-  const i = s.indexOf(",");
-  return s.startsWith("data:") && i >= 0 ? s.slice(i + 1) : s;
+/* ------------------------------------------------------------------ 图片查看 */
+
+const viewer = { zoom: 1, src: "", baseW: 0, baseH: 0 };
+
+/** 按视口等比算出基准尺寸。之后所有缩放都在这个尺寸上乘系数，
+    直接改 width/height 而不是 transform：transform 不改变布局尺寸，
+    flex 居中时放大的部分会被四周对称裁掉且滚动条也滚不到。 */
+function fitLightbox() {
+  const img = $("#lightboxImg");
+  if (!img || !img.naturalWidth || !img.naturalHeight) return;
+  const availW = Math.max(160, window.innerWidth - 80);
+  const availH = Math.max(160, window.innerHeight - 148);
+  const scale = Math.min(1, availW / img.naturalWidth, availH / img.naturalHeight);
+  viewer.baseW = Math.max(1, Math.round(img.naturalWidth * scale));
+  viewer.baseH = Math.max(1, Math.round(img.naturalHeight * scale));
+  viewer.zoom = 1;
+  applyZoom();
 }
 
-function lastDoneImage() {
-  for (let i = state.turns.length - 1; i >= 0; i--) {
-    const t = state.turns[i];
-    if (t.status === "done" && t.image) return t;
-  }
-  return null;
+function applyZoom() {
+  const img = $("#lightboxImg");
+  if (!viewer.baseW) return;
+  img.style.width = Math.round(viewer.baseW * viewer.zoom) + "px";
+  img.style.height = Math.round(viewer.baseH * viewer.zoom) + "px";
 }
 
-/** 换号时准备注入上下文。 */
-function markPendingInject() {
-  state.pendingInject = true;
+function openLightbox(src) {
+  if (!src) return;
+  viewer.src = src;
+  viewer.zoom = 1;
+  viewer.baseW = 0;
+  viewer.baseH = 0;
+  const img = $("#lightboxImg");
+  img.style.width = "";
+  img.style.height = "";
+  img.onload = fitLightbox;
+  img.src = src;
+  // 同一张图命中缓存时 onload 可能不再触发，用同步尺寸兜底。
+  if (img.complete && img.naturalWidth) fitLightbox();
+  $("#lightboxDownload").href = src;
+  $("#lightbox").hidden = false;
 }
 
-/**
- * 上下文注入：带**真实轮次**编号，不能从 1 重新数，
- * 否则模型会把顺序理解错。
- */
-function composeInjectedPrompt(turns, current, limit) {
-  const n = Math.max(1, limit || 5);
-  const kept = turns.slice(Math.max(0, turns.length - n));
-  if (kept.length === 0) return current.trim();
-  const start = turns.length - kept.length;
-  const ctx = kept.map((t, i) => `第 ${start + i + 1} 轮：${t.prompt.trim()}`).join("\n");
-  return `【这是一个续接的会话，之前的内容如下】\n${ctx}\n\n【本轮要求】\n${current.trim()}`;
+function closeLightbox() {
+  const box = $("#lightbox");
+  if (box.hidden) return;
+  box.hidden = true;
+  const img = $("#lightboxImg");
+  img.onload = null;
+  img.style.width = "";
+  img.style.height = "";
+  img.removeAttribute("src");
+  viewer.src = "";
+  viewer.zoom = 1;
+  viewer.baseW = 0;
+  viewer.baseH = 0;
+}
+
+function setZoom(next) {
+  viewer.zoom = Math.max(0.4, Math.min(4, next));
+  applyZoom();
 }
 
 /* ------------------------------------------------------------------ 总览 */
@@ -524,76 +990,41 @@ function renderOverview(stage) {
       text: "每个账号的额度窗口互相独立，按各自的下次刷新时间滚动重置。刷新会重新向 OpenAI 查询真实额度，已到期的限流/冻结账号会自动恢复可用。",
     })
   );
-
   const usable = state.accounts.filter((a) => a.usable);
   const total = state.accounts.reduce((s, a) => s + (a.quota || 0), 0);
-
-  const bar = el("div", { class: "row", style: "margin-bottom:16px;gap:10px" }, [
-    el("span", { class: "badge ok", text: `可用 ${usable.length} / ${state.accounts.length}` }),
-    el("span", { class: "badge mute", text: `总额度 ${total} 张` }),
-    el("span", { class: "spacer" }),
-    el("button", {
-      class: "btn",
-      text: state.loadingAccounts ? "刷新中…" : "刷新额度",
-      disabled: state.loadingAccounts ? "disabled" : null,
-      onclick: () => loadAccounts(true),
-    }),
-    el("button", {
-      class: "btn danger",
-      text: "一键删除限流/冻结",
-      onclick: () => deleteBlocked(),
-    }),
-  ]);
-  page.appendChild(bar);
-
+  page.appendChild(
+    el("div", { class: "row", style: "margin-bottom:16px;gap:10px" }, [
+      el("span", { class: "badge ok", text: `可用 ${usable.length} / ${state.accounts.length}` }),
+      el("span", { class: "badge mute", text: `总额度 ${total} 张` }),
+      el("span", { class: "spacer" }),
+      el("button", { class: "btn", text: state.loadingAccounts ? "刷新中…" : "刷新额度", disabled: state.loadingAccounts ? "disabled" : null, onclick: () => loadAccounts(true) }),
+      el("button", { class: "btn danger", text: "一键删除限流/冻结", onclick: () => deleteBlocked() }),
+    ])
+  );
   const section = el("div", { class: "section" });
   if (state.accounts.length === 0) {
     section.appendChild(el("div", { class: "empty", html: "<strong>还没有账号</strong>在「号池管理」中导入账号。" }));
   } else {
     const table = el("table", { class: "table" });
-    table.appendChild(
-      el("tr", {}, [
-        el("th", { text: "账号" }),
-        el("th", { text: "状态" }),
-        el("th", { text: "剩余额度" }),
-        el("th", { text: "下次刷新" }),
-        el("th", { text: "倒计时" }),
-        el("th", { text: "" }),
-      ])
-    );
-    sortedAccounts().forEach((a, idx) => {
+    table.appendChild(el("tr", {}, [
+      el("th", { text: "账号" }), el("th", { text: "状态" }), el("th", { text: "剩余额度" }),
+      el("th", { text: "下次刷新" }), el("th", { text: "倒计时" }), el("th", { text: "" }),
+    ]));
+    sortedAccounts().forEach((a) => {
       const badgeClass = a.blocked ? "bad" : a.quota <= 0 ? "warn" : "ok";
       const pct = Math.max(4, Math.min(100, Math.round((a.quota / 24) * 100)));
       const barColor = a.blocked || a.quota <= 0 ? "bad" : a.quota <= 3 ? "warn" : "";
-      const row = el("tr", {}, [
+      table.appendChild(el("tr", {}, [
         el("td", {}, [el("div", { style: "color:var(--text)", text: a.name }), el("div", { style: "font-size:11px;color:var(--text-faint)", text: a.email })]),
         el("td", {}, [el("span", { class: "badge " + badgeClass, text: a.status || "未知" })]),
-        el("td", {}, [
-          el("div", { class: "row", style: "gap:8px" }, [
-            el("span", { class: "mono", style: "color:var(--text);min-width:24px", text: String(a.quota) }),
-            el("div", { class: "bar" }, [el("i", { class: barColor, style: `width:${a.blocked ? 4 : pct}%` })]),
-          ]),
-        ]),
+        el("td", {}, [el("div", { class: "row", style: "gap:8px" }, [el("span", { class: "mono", style: "color:var(--text);min-width:24px", text: String(a.quota) }), el("div", { class: "bar" }, [el("i", { class: barColor, style: `width:${a.blocked ? 4 : pct}%` })])])]),
         el("td", { class: "mono", text: localWhen(a.reset_at, Date.now()) }),
         el("td", { class: "mono", style: a.reset_due ? "color:var(--ok)" : "", text: a.reset_due ? "已到期，可刷新" : humanize(a.reset_in_ms) }),
-        el("td", {}, [
-          el("button", {
-            class: "btn",
-            style: "height:24px;padding:0 8px;font-size:11.5px",
-            text: "删除",
-            onclick: async () => {
-              try {
-                await call("delete_accounts", { tokens: [a.access_token] });
-                toast("已删除 " + a.name);
-                loadAccounts(false);
-              } catch (e) {
-                toast(String(e), true);
-              }
-            },
-          }),
-        ]),
-      ]);
-      table.appendChild(row);
+        el("td", {}, [el("button", { class: "btn", style: "height:24px;padding:0 8px;font-size:11.5px", text: "删除", onclick: async () => {
+          try { await call("delete_accounts", { tokens: [a.access_token] }); toast("已删除 " + a.name); loadAccounts(false); }
+          catch (e) { toast(String(e), true); }
+        } })]),
+      ]));
     });
     section.appendChild(table);
   }
@@ -609,9 +1040,7 @@ async function deleteBlocked() {
     await call("delete_accounts", { tokens: targets.map((a) => a.access_token) });
     toast(`已删除 ${targets.length} 个账号`);
     loadAccounts(false);
-  } catch (e) {
-    toast(String(e), true);
-  }
+  } catch (e) { toast(String(e), true); }
 }
 
 /* ------------------------------------------------------------------ 号池 */
@@ -627,30 +1056,16 @@ function renderPool(stage) {
     const table = el("table", { class: "table" });
     table.appendChild(el("tr", {}, [el("th", { text: "账号" }), el("th", { text: "类型" }), el("th", { text: "状态" }), el("th", { text: "额度" }), el("th", { text: "" })]));
     sortedAccounts().forEach((a) => {
-      table.appendChild(
-        el("tr", {}, [
-          el("td", { style: "color:var(--text)", text: a.email }),
-          el("td", { text: a.plan || "free" }),
-          el("td", {}, [el("span", { class: "badge " + (a.blocked ? "bad" : "ok"), text: a.status })]),
-          el("td", { class: "mono", text: String(a.quota) }),
-          el("td", {}, [
-            el("button", {
-              class: "btn",
-              style: "height:24px;padding:0 8px;font-size:11.5px",
-              text: "删除",
-              onclick: async () => {
-                try {
-                  await call("delete_accounts", { tokens: [a.access_token] });
-                  toast("已删除 " + a.name);
-                  loadAccounts(false);
-                } catch (e) {
-                  toast(String(e), true);
-                }
-              },
-            }),
-          ]),
-        ])
-      );
+      table.appendChild(el("tr", {}, [
+        el("td", { style: "color:var(--text)", text: a.email }),
+        el("td", { text: a.plan || "free" }),
+        el("td", {}, [el("span", { class: "badge " + (a.blocked ? "bad" : "ok"), text: a.status })]),
+        el("td", { class: "mono", text: String(a.quota) }),
+        el("td", {}, [el("button", { class: "btn", style: "height:24px;padding:0 8px;font-size:11.5px", text: "删除", onclick: async () => {
+          try { await call("delete_accounts", { tokens: [a.access_token] }); toast("已删除 " + a.name); loadAccounts(false); }
+          catch (e) { toast(String(e), true); }
+        } })]),
+      ]));
     });
     section.appendChild(table);
   }
@@ -666,12 +1081,10 @@ function renderApi(stage) {
   page.appendChild(el("p", { class: "page-sub", text: "本机后端提供 OpenAI 兼容接口，可直接用于第三方客户端。" }));
   const base = state.baseUrl || "http://127.0.0.1:38650";
   const section = el("div", { class: "section" });
-  section.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [el("div", { class: "field-label", text: "接口地址" }), el("div", { class: "field-hint", text: "填到第三方客户端的 Base URL，模型名填 gpt-image-2。" })]),
-      el("button", { class: "btn", text: "复制", onclick: () => copy(base + "/v1") }),
-    ])
-  );
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "接口地址" }), el("div", { class: "field-hint", text: "填到第三方客户端的 Base URL，模型名填 gpt-image-2。" })]),
+    el("button", { class: "btn", text: "复制", onclick: () => copy(base + "/v1") }),
+  ]));
   section.appendChild(el("div", { style: "padding:14px 18px" }, [
     el("div", { class: "code-block", text: `POST ${base}/v1/images/generations\nAuthorization: Bearer <admin-key>\nContent-Type: application/json\n\n{\n  "model": "gpt-image-2",\n  "prompt": "一只橘猫坐在木窗台上",\n  "n": 1,\n  "response_format": "b64_json"\n}` }),
   ]));
@@ -702,72 +1115,30 @@ function renderSettings(stage) {
   const page = el("div", { class: "page" });
   page.appendChild(el("h1", { class: "page-title", text: "插件设置" }));
   page.appendChild(el("p", { class: "page-sub", text: "设置会立即保存到本地配置。" }));
-
   const section = el("div", { class: "section" });
-
-  section.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [
-        el("div", { class: "field-label", text: "输出文字说明" }),
-        el("div", { class: "field-hint", text: "开启后每轮会在图片之外再生成一段文字描述。生图模型本身只出图，文字由额外的文本请求补上，会多消耗一次额度。" }),
-      ]),
-      el("button", {
-        class: "switch" + (state.settings.text_reply ? " on" : ""),
-        role: "switch",
-        "aria-checked": state.settings.text_reply ? "true" : "false",
-        onclick: () => saveSettings({ text_reply: !state.settings.text_reply }),
-      }),
-    ])
-  );
-
-  section.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [el("div", { class: "field-label", text: "换号上下文轮数" }), el("div", { class: "field-hint", text: "换号后注入最近多少轮文字，编号保留真实轮次。" })]),
-      el("input", {
-        class: "input",
-        type: "number",
-        min: "1",
-        max: "50",
-        value: String(state.settings.context_rounds),
-        onchange: (e) => saveSettings({ context_rounds: Number(e.target.value) || 5 }),
-      }),
-    ])
-  );
-
-  section.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [el("div", { class: "field-label", text: "启动时检查更新" })]),
-      el("button", {
-        class: "switch" + (state.settings.auto_check_update ? " on" : ""),
-        role: "switch",
-        onclick: () => saveSettings({ auto_check_update: !state.settings.auto_check_update }),
-      }),
-    ])
-  );
-
-  section.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [el("div", { class: "field-label", text: "图片保存目录" }), el("div", { class: "field-hint", text: state.imagesDir || "" })]),
-      el("button", { class: "btn", text: "打开文件夹", onclick: () => call("reveal_images").catch((e) => toast(String(e), true)) }),
-    ])
-  );
-
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "输出文字说明" }), el("div", { class: "field-hint", text: "开启后每轮会在图片之外再生成一段文字描述。生图模型本身只出图，文字由额外的文本请求补上，会多消耗一次额度。" })]),
+    el("button", { class: "switch" + (state.settings.text_reply ? " on" : ""), role: "switch", "aria-checked": state.settings.text_reply ? "true" : "false", onclick: () => saveSettings({ text_reply: !state.settings.text_reply }) }),
+  ]));
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "换号上下文轮数" }), el("div", { class: "field-hint", text: "换号后注入最近多少轮文字，编号保留真实轮次。" })]),
+    el("input", { class: "input", type: "number", min: "1", max: "50", value: String(state.settings.context_rounds), onchange: (e) => saveSettings({ context_rounds: Number(e.target.value) || 5 }) }),
+  ]));
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "启动时自动检查并更新" }), el("div", { class: "field-hint", text: "发现新版本时会在应用内自动下载并安装，完成后只需点一次重启。" })]),
+    el("button", { class: "switch" + (state.settings.auto_check_update ? " on" : ""), role: "switch", onclick: () => saveSettings({ auto_check_update: !state.settings.auto_check_update }) }),
+  ]));
+  section.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "图片保存目录" }), el("div", { class: "field-hint", text: state.imagesDir || "" })]),
+    el("button", { class: "btn", text: "打开文件夹", onclick: () => call("reveal_images").catch((e) => toast(String(e), true)) }),
+  ]));
   page.appendChild(section);
 
   const about = el("div", { class: "section", style: "margin-top:16px" });
-  about.appendChild(
-    el("div", { class: "field" }, [
-      el("div", {}, [
-        el("div", { class: "field-label", text: "当前版本 v" + state.version }),
-        el("div", { class: "field-hint", text: state.update && state.update.has_update ? `发现新版本 v${state.update.latest}` : "已是最新版本" }),
-      ]),
-      el("button", {
-        class: "btn",
-        text: state.update && state.update.has_update ? "下载更新" : "检查更新",
-        onclick: () => (state.update && state.update.has_update ? doDownload() : checkUpdate()),
-      }),
-    ])
-  );
+  about.appendChild(el("div", { class: "field" }, [
+    el("div", {}, [el("div", { class: "field-label", text: "当前版本 v" + state.version }), el("div", { class: "field-hint", text: state.update && state.update.has_update ? `发现新版本 v${state.update.latest}` : "已是最新版本" })]),
+    el("button", { class: "btn", text: "检查更新", onclick: () => checkUpdate(true) }),
+  ]));
   page.appendChild(about);
   stage.appendChild(page);
 }
@@ -784,45 +1155,108 @@ async function saveSettings(patch) {
   render();
 }
 
-/* ------------------------------------------------------------------ 更新 */
+/* ------------------------------------------------------------------ 应用内更新 */
 
-async function checkUpdate() {
+function renderUpdateBar() {
+  const bar = $("#updateBar");
+  const s = state.updateState;
+  if (!s || s.stage === "idle" || s.stage === "dismissed") {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const title = $("#updateTitle");
+  const desc = $("#updateDesc");
+  const later = $("#updateLater");
+  const action = $("#updateAction");
+  const v = s.info ? "v" + s.info.latest : "";
+  later.hidden = true;
+  action.hidden = true;
+  later.onclick = () => {
+    clearTimeout(autoUpdateTimer);
+    state.updateState = { stage: "dismissed" };
+    renderUpdateBar();
+  };
+  if (s.stage === "found") {
+    title.textContent = `发现新版本 ${v}`;
+    desc.textContent = "8 秒后自动下载并安装，无需手动打开安装包；不想现在更新可点「稍后」";
+    later.hidden = false;
+    action.hidden = false;
+    action.textContent = "立即更新";
+    action.onclick = () => { clearTimeout(autoUpdateTimer); startAutoUpdate(); };
+  } else if (s.stage === "downloading") {
+    title.textContent = `正在下载 ${v}…`;
+    desc.textContent = "走 gh-proxy 镜像，下载完成后会自动安装";
+    later.hidden = false;
+  } else if (s.stage === "installing") {
+    title.textContent = `正在安装 ${v}…`;
+    desc.textContent = "请勿关闭应用，安装完成后点一下重启即可";
+  } else if (s.stage === "done") {
+    title.textContent = `已更新到 ${v}`;
+    desc.textContent = "新版本已安装，重启应用后生效";
+    action.hidden = false;
+    action.textContent = "立即重启";
+    action.onclick = () => call("restart_app").catch(() => {});
+  } else if (s.stage === "error") {
+    title.textContent = "更新失败";
+    desc.textContent = s.message || "可以在设置里重新检查更新";
+    later.hidden = false;
+    action.hidden = false;
+    action.textContent = "重试";
+    action.onclick = () => startAutoUpdate();
+  }
+}
+
+async function checkUpdate(manual) {
   try {
     const info = await call("check_update");
     state.update = info;
     renderRail();
-    if (info.has_update) toast(`发现新版本 v${info.latest}`);
-    else toast("已是最新版本");
+    if (info.has_update) {
+      state.updateState = { stage: "found", info };
+      renderUpdateBar();
+      if (!manual && state.settings.auto_check_update) {
+        clearTimeout(autoUpdateTimer);
+        // 留出足够时间让用户看到提示并点「稍后」；不点就全自动完成。
+        autoUpdateTimer = setTimeout(() => startAutoUpdate(), 8000);
+      }
+    } else if (manual) {
+      state.updateState = { stage: "idle" };
+      renderUpdateBar();
+      toast("已是最新版本");
+    }
   } catch (e) {
-    toast(String(e && e.message ? e.message : e), true);
+    if (manual) toast(String(e && e.message ? e.message : e), true);
   }
 }
 
-async function doDownload() {
-  const info = state.update;
+async function startAutoUpdate() {
+  const s = state.updateState;
+  const info = s && s.info ? s.info : state.update;
   if (!info) return;
-  const url = info.proxy_url || info.direct_url;
-  if (!url) return toast("该版本没有可下载的安装包", true);
-  toast("开始下载（走 gh-proxy 镜像）…");
+  // 必须传直连地址：后端 download() 自己会拼 gh-proxy 前缀并依次回退。
+  // 传 proxy_url 会被再代理一次，拿到双重前缀的错误页还被当成安装包写盘。
+  const url = info.direct_url || info.proxy_url;
+  if (!url) {
+    state.updateState = { stage: "error", info, message: "该版本没有可下载的安装包" };
+    return renderUpdateBar();
+  }
   try {
+    state.updateState = { stage: "downloading", info };
+    renderUpdateBar();
     const path = await call("download_update", { url, version: info.latest });
-    toast("已下载到 " + path);
+    state.updateState = { stage: "installing", info, path };
+    renderUpdateBar();
+    await call("install_update", { path, version: info.latest });
+    state.updateState = { stage: "done", info, path };
+    renderUpdateBar();
   } catch (e) {
-    toast(String(e && e.message ? e.message : e), true);
+    state.updateState = { stage: "error", info, message: String(e && e.message ? e.message : e) };
+    renderUpdateBar();
   }
 }
 
 /* ------------------------------------------------------------------ 浮层 */
-
-function openLightbox(src) {
-  const box = $("#lightbox");
-  $("#lightboxImg").src = src;
-  box.hidden = false;
-}
-function closeLightbox() {
-  $("#lightbox").hidden = true;
-  $("#lightboxImg").src = "";
-}
 
 function openMenu() {
   $("#avatarMenu").hidden = false;
@@ -833,39 +1267,56 @@ function closeMenu() {
   $("#avatarBtn").setAttribute("aria-expanded", "false");
 }
 
-/* ------------------------------------------------------------------ 启动 */
-
 function bindChrome() {
   $("#avatarBtn").addEventListener("click", (e) => {
     e.stopPropagation();
-    const open = $("#avatarMenu").hidden;
-    open ? openMenu() : closeMenu();
+    $("#avatarMenu").hidden ? openMenu() : closeMenu();
   });
-  $("#logoBtn").addEventListener("click", () => setRoute("home"));
-  $("#versionBtn").addEventListener("click", checkUpdate);
-  $$("#avatarMenu .menu-item").forEach((b) =>
-    b.addEventListener("click", () => setRoute(b.dataset.route))
-  );
-  $("#lightbox").addEventListener("click", closeLightbox);
-  $("#lightboxClose").addEventListener("click", closeLightbox);
+  $("#logoBtn").addEventListener("click", () => newConversation());
+  $("#versionBtn").addEventListener("click", () => checkUpdate(true));
+  $$("#avatarMenu .menu-item").forEach((b) => b.addEventListener("click", () => setRoute(b.dataset.route)));
+
+  const box = $("#lightbox");
+  const img = $("#lightboxImg");
+  $("#lightboxClose").addEventListener("click", (e) => { e.stopPropagation(); closeLightbox(); });
+  $("#lightboxInner").addEventListener("click", (e) => { if (e.target === e.currentTarget) closeLightbox(); });
+  box.addEventListener("click", (e) => { if (e.target === box) closeLightbox(); });
+  img.addEventListener("click", (e) => e.stopPropagation());
+  img.addEventListener("dblclick", (e) => { e.stopPropagation(); setZoom(1); });
+  box.addEventListener("wheel", (e) => {
+    if (box.hidden) return;
+    // 未放大时滚轮缩放；一旦超出视口，普通滚轮交还给容器做平移，
+    // 否则放大后的边缘永远滚不到。按住 Ctrl/⌘ 则任何时候都是缩放。
+    if (viewer.zoom > 1 && !e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    setZoom(viewer.zoom + (e.deltaY < 0 ? 0.15 : -0.15));
+  }, { passive: false });
+  const stop = (e) => e.stopPropagation();
+  $("#lightboxZoomIn").addEventListener("click", (e) => { stop(e); setZoom(viewer.zoom + 0.25); });
+  $("#lightboxZoomOut").addEventListener("click", (e) => { stop(e); setZoom(viewer.zoom - 0.25); });
+  $("#lightboxFit").addEventListener("click", (e) => { stop(e); setZoom(1); });
+  $(".lightbox-toolbar").addEventListener("click", stop);
+
+  window.addEventListener("resize", () => {
+    if (!$("#lightbox").hidden && viewer.baseW) fitLightbox();
+  });
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape") {
-      closeLightbox();
-      closeMenu();
-      if (state.accountPopOpen) {
-        state.accountPopOpen = false;
-        render();
-      }
+    if (e.key !== "Escape") return;
+    closeLightbox();
+    closeMenu();
+    if (state.accountPopOpen) {
+      state.accountPopOpen = false;
+      render();
     }
   });
   document.addEventListener("click", (e) => {
-    if (!$( "#avatarMenu").hidden && !e.target.closest("#avatarMenu,#avatarBtn")) closeMenu();
+    if (!$("#avatarMenu").hidden && !e.target.closest("#avatarMenu,#avatarBtn")) closeMenu();
   });
-  // 每 30 秒刷新倒计时
-  tickTimer = setInterval(() => {
-    if (state.route === "overview" || state.accountPopOpen) render();
-  }, 30000);
+  tickTimer = setInterval(() => render(), 30000);
 }
+
+/* ------------------------------------------------------------------ 启动 */
 
 async function boot() {
   bindChrome();
@@ -878,15 +1329,30 @@ async function boot() {
     state.imagesDir = info.images_dir;
     state.settings = info.settings;
   } catch (e) {
-    // 浏览器里预览时没有 Tauri，给个降级提示而不是白屏
+    // 浏览器预览时没有 Tauri，界面照常渲染，只是不能生图。
     state.version = "0.0.0-preview";
   }
+
+  try {
+    state.conversations = (await call("list_conversations")) || [];
+    if (state.conversations.length) {
+      const data = await call("load_conversation", { id: state.conversations[0].id });
+      state.conversation = normalizeConversation(data || {});
+    }
+  } catch (e) {
+    state.conversations = [];
+  }
+  if (!state.conversation) {
+    const now = Date.now();
+    state.conversation = { id: uid("c"), title: "新会话", createdAt: now, updatedAt: now, turns: [] };
+  }
+
   render();
   await loadAccounts(false);
-  if (state.settings.auto_check_update) checkUpdate();
+  if (state.settings.auto_check_update) checkUpdate(false);
 }
 
 boot();
 
-/* 供测试使用：这些函数是纯函数，单独导出便于回归验证。 */
-window.__gif = { humanize, localWhen, parseIsoUtc, composeInjectedPrompt, sortedAccounts };
+/* 供回归测试使用：纯函数挂到 window。 */
+window.__gif = { humanize, localWhen, parseIsoUtc, composeInjectedPrompt, sortedAccounts, stripDataUrl, normalizeConversation };

@@ -7,6 +7,7 @@ pub mod accounts;
 pub mod api;
 pub mod chat;
 pub mod commands;
+pub mod conversations;
 pub mod settings;
 pub mod storage;
 pub mod updater;
@@ -27,6 +28,12 @@ pub fn run() {
             commands::check_update,
             commands::download_update,
             commands::conversation_summary,
+            commands::list_conversations,
+            commands::load_conversation,
+            commands::save_conversation,
+            commands::delete_conversation,
+            commands::install_update,
+            commands::restart_app,
             commands::reveal_images,
         ])
         .run(tauri::generate_context!())

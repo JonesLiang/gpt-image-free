@@ -3,6 +3,7 @@
 use crate::accounts::AccountView;
 use crate::api::{self, ApiError, Client};
 use crate::chat::Conversation;
+use crate::conversations::{self, ConversationMeta};
 use crate::settings::Settings;
 use crate::updater::{self, ReleaseInfo};
 use serde::Serialize;
@@ -186,6 +187,43 @@ pub fn conversation_summary(conversation: Conversation) -> serde_json::Value {
         "done": conversation.done_count(),
         "latest_round": conversation.latest_image_round(),
     })
+}
+
+/* ---------------------------------------------------------------- 会话持久化 */
+
+/// 启动时只拉轻量索引，完整会话（含图片）按需读取。
+#[tauri::command]
+pub fn list_conversations() -> Vec<ConversationMeta> {
+    conversations::list()
+}
+
+#[tauri::command]
+pub fn load_conversation(id: String) -> Result<Option<serde_json::Value>, String> {
+    conversations::load(&id)
+}
+
+#[tauri::command]
+pub fn save_conversation(conversation: serde_json::Value) -> Result<ConversationMeta, String> {
+    conversations::save(&conversation)
+}
+
+#[tauri::command]
+pub fn delete_conversation(id: String) -> Result<(), String> {
+    conversations::remove(&id)
+}
+
+/* ---------------------------------------------------------------- 应用内更新 */
+
+/// 下载完成后在应用内完成安装（macOS 覆盖 /Applications，Windows 静默安装）。
+#[tauri::command]
+pub fn install_update(path: String, version: String) -> Result<String, String> {
+    updater::install(&path, &version)
+}
+
+/// 启动新版本并退出当前进程。
+#[tauri::command]
+pub fn restart_app() -> Result<(), String> {
+    updater::restart()
 }
 
 #[tauri::command]

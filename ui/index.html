@@ -11,7 +11,7 @@
       <!-- 左侧窄栏：只放导航图标，最底部是头像 -->
       <aside class="rail">
         <div class="rail-top">
-          <button class="rail-logo" id="logoBtn" title="首页" aria-label="首页"></button>
+          <button class="rail-logo" id="logoBtn" title="新建对话" aria-label="新建对话"></button>
           <nav class="rail-nav" id="railNav" aria-label="导航"></nav>
         </div>
         <div class="rail-bottom">
@@ -52,9 +52,29 @@
 
       <main class="stage" id="stage"></main>
 
-      <!-- 全局图片放大 -->
+      <!-- 应用内更新提示条 -->
+      <div class="update-bar" id="updateBar" hidden>
+        <span class="update-pulse"></span>
+        <div class="update-copy">
+          <strong id="updateTitle"></strong>
+          <span id="updateDesc"></span>
+        </div>
+        <button class="btn" id="updateLater" hidden>稍后</button>
+        <button class="btn primary" id="updateAction" hidden>立即更新</button>
+      </div>
+
+      <!-- 全局图片查看器 -->
       <div class="lightbox" id="lightbox" hidden>
-        <img id="lightboxImg" alt="" />
+        <div class="lightbox-inner" id="lightboxInner">
+          <img id="lightboxImg" alt="" draggable="false" />
+        </div>
+        <div class="lightbox-toolbar">
+          <span class="lightbox-tip">滚轮缩放 · 放大后滚动平移 · 双击复位 · Esc 关闭</span>
+          <button id="lightboxZoomOut" title="缩小">−</button>
+          <button id="lightboxFit" title="适应窗口">适应</button>
+          <button id="lightboxZoomIn" title="放大">+</button>
+          <a id="lightboxDownload" download="image.png" title="下载图片">下载</a>
+        </div>
         <button class="lightbox-close" id="lightboxClose" aria-label="关闭">×</button>
       </div>
 

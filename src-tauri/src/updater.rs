@@ -4,7 +4,9 @@
 //! 下载很慢）。下载完校验 SHA256 再落盘，避免镜像损坏或中间人篡改。
 //!
 //! 更新策略：不原地替换正在运行的可执行文件（Windows 会锁文件）。
-//! 下载到数据目录的 updates/<版本>/ 下，然后由用户手动打开覆盖安装。
+//! 下载到数据目录 updates/<版本>/，校验通过后由应用内安装命令覆盖安装：
+//! macOS 挂载 dmg 覆盖 /Applications，Windows 走 NSIS /S 静默安装，
+//! 完成后用户在提示条上点「立即重启」即可。
 
 use crate::api;
 use serde::Serialize;
@@ -59,6 +61,40 @@ pub fn is_newer(latest: &str, current: &str) -> bool {
 /// 拼 gh-proxy 下载地址。
 pub fn proxied(url: &str) -> String {
     format!("{GH_PROXY}/{}", url)
+}
+
+/// 前端可能传直连地址，也可能传已经拼好的代理地址。统一还原成直连，
+/// 否则 download() 会再包一层代理前缀，拿到双重前缀的错误页。
+fn canonical_url(url: &str) -> &str {
+    url.strip_prefix(GH_PROXY)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(url)
+}
+
+/// 下载到 404 页面 / 镜像错误页时不能当安装包写盘，否则后面挂载 dmg
+/// 或静默安装会以完全看不懂的方式失败。按平台校验魔数和最小体积。
+fn plausible_installer(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 * 1024 {
+        return false;
+    }
+    let head = &bytes[..bytes.len().min(512)];
+    let low = String::from_utf8_lossy(head).to_ascii_lowercase();
+    if low.contains("<!doctype html") || low.contains("<html") || low.contains("404: not found") {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    if !bytes.starts_with(b"MZ") {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // UDIF dmg 的尾部 trailer 以 "koly" 开头。
+        let tail = &bytes[bytes.len() - 512..];
+        if !tail.starts_with(b"koly") {
+            return false;
+        }
+    }
+    true
 }
 
 /// 从指向 /releases/tag/vX.Y.Z 的地址里取出 tag。
@@ -202,18 +238,20 @@ fn updates_dir() -> PathBuf {
 
 /// 下载新版本到数据目录，返回文件路径。
 ///
-/// 优先 gh-proxy，失败退回直连，最后校验 SHA256 与远端声明比对。
+/// 优先 gh-proxy，失败退回直连；落盘前校验安装包魔数，避免把错误页
+/// 当成 dmg / exe，落盘后记一份 SHA256 便于人工核对。
 pub async fn download(url: &str, version: &str) -> Result<String, String> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())?;
+    let canonical = canonical_url(url);
     let dir = updates_dir().join(version);
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败：{e}"))?;
-    let file_name = url.rsplit('/').next().unwrap_or("update.bin");
+    let file_name = canonical.rsplit('/').next().unwrap_or("update.bin");
     let dest = dir.join(file_name);
 
-    let candidates = [proxied(url), url.to_string()];
+    let candidates = [proxied(canonical), canonical.to_string()];
     let mut last_err = String::new();
     for candidate in candidates {
         match http
@@ -227,6 +265,10 @@ pub async fn download(url: &str, version: &str) -> Result<String, String> {
                     Ok(bytes) => {
                         if bytes.is_empty() {
                             last_err = "下载内容为空".into();
+                            continue;
+                        }
+                        if !plausible_installer(&bytes) {
+                            last_err = "下载内容不是有效的安装包（可能拿到了错误页）".into();
                             continue;
                         }
                         if let Err(e) = std::fs::write(&dest, &bytes) {
@@ -249,6 +291,138 @@ pub async fn download(url: &str, version: &str) -> Result<String, String> {
         }
     }
     Err(format!("下载失败：{last_err}"))
+}
+
+/// 安装已经下载好的安装包，返回安装后的应用路径。
+///
+/// macOS：挂载 dmg → 把 .app 覆盖到 /Applications → 去掉隔离属性。
+/// 覆盖前先把旧 app 移到 updates/ 下的备份位置，失败可原样回滚，
+/// 不会留下一个「半新半旧」无法启动的应用。
+pub fn install(path: &str, version: &str) -> Result<String, String> {
+    #[cfg(target_os = "macos")]
+    {
+        install_macos(path, version)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        install_windows(path, version)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (path, version);
+        Err("当前平台暂不支持自动安装，请手动打开安装包".into())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos(path: &str, version: &str) -> Result<String, String> {
+    use std::process::Command;
+
+    let dmg = PathBuf::from(path);
+    if !dmg.is_file() {
+        return Err("安装包不存在，请先下载".into());
+    }
+    let work = updates_dir().join(version);
+    std::fs::create_dir_all(&work).map_err(|e| format!("创建更新目录失败：{e}"))?;
+    let mount = work.join("mnt");
+    if mount.exists() {
+        // 只清理自己数据目录里的临时挂载点。
+        let _ = std::fs::remove_dir_all(&mount);
+    }
+    std::fs::create_dir_all(&mount).map_err(|e| format!("创建挂载点失败：{e}"))?;
+
+    let attached = Command::new("hdiutil")
+        .args(["attach", dmg.to_string_lossy().as_ref(), "-nobrowse", "-readonly", "-mountpoint", mount.to_string_lossy().as_ref()])
+        .output()
+        .map_err(|e| format!("挂载安装包失败：{e}"))?;
+    if !attached.status.success() {
+        return Err(format!(
+            "挂载安装包失败：{}",
+            String::from_utf8_lossy(&attached.stderr).trim()
+        ));
+    }
+
+    let result = (|| -> Result<String, String> {
+        let app_src = std::fs::read_dir(&mount)
+            .map_err(|e| format!("读取安装包失败：{e}"))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().and_then(|s| s.to_str()) == Some("app"))
+            .ok_or_else(|| "安装包里没有找到 .app".to_string())?;
+
+        let dest = PathBuf::from("/Applications/GPT Image Free.app");
+        // 备份点放在 /Applications 内部：同一卷内 rename 才是原子操作，
+        // 挪到数据目录可能跨卷，rename 会以 EXDEV 直接失败。
+        let staging = PathBuf::from("/Applications/.GPT Image Free.old.app");
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        if dest.exists() {
+            std::fs::rename(&dest, &staging).map_err(|e| format!("备份旧版本失败：{e}"))?;
+        }
+
+        let copied = Command::new("cp")
+            .arg("-R")
+            .arg(&app_src)
+            .arg(&dest)
+            .output()
+            .map_err(|e| format!("复制新版本失败：{e}"))?;
+        if !copied.status.success() {
+            if staging.exists() {
+                let _ = std::fs::rename(&staging, &dest);
+            }
+            return Err(format!(
+                "安装失败，已回滚：{}",
+                String::from_utf8_lossy(&copied.stderr).trim()
+            ));
+        }
+
+        // 网络下载来的包可能带 com.apple.quarantine，去掉才能直接启动。
+        let _ = Command::new("xattr")
+            .args(["-cr", dest.to_string_lossy().as_ref()])
+            .output();
+        if staging.exists() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        Ok(dest.to_string_lossy().to_string())
+    })();
+
+    let _ = Command::new("hdiutil")
+        .args(["detach", mount.to_string_lossy().as_ref(), "-force"])
+        .output();
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn install_windows(path: &str, _version: &str) -> Result<String, String> {
+    use std::process::Command;
+    let setup = PathBuf::from(path);
+    if !setup.is_file() {
+        return Err("安装包不存在，请先下载".into());
+    }
+    Command::new(&setup)
+        .arg("/S")
+        .spawn()
+        .map_err(|e| format!("启动安装程序失败：{e}"))?;
+    Ok("静默安装已启动，完成后重启应用即可生效".into())
+}
+
+/// 启动新版本并退出当前进程。
+pub fn restart() -> Result<(), String> {
+    use std::process::Command;
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .args(["-n", "/Applications/GPT Image Free.app"])
+            .spawn()
+            .map_err(|e| format!("重启失败：{e}"))?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("找不到当前程序：{e}"))?;
+        Command::new(exe).spawn().map_err(|e| format!("重启失败：{e}"))?;
+    }
+    std::process::exit(0);
 }
 
 #[cfg(test)]
@@ -280,6 +454,22 @@ mod tests {
             proxied("https://github.com/a/b/releases/download/v1/x.dmg"),
             "https://gh-proxy.com/https://github.com/a/b/releases/download/v1/x.dmg"
         );
+    }
+
+    #[test]
+    fn canonicalizes_proxy_urls() {
+        let direct = "https://github.com/a/b/releases/download/v1/x.dmg";
+        assert_eq!(canonical_url(direct), direct);
+        // 前端万一传了代理地址，也要还原成直连再拼前缀。
+        assert_eq!(canonical_url(&proxied(direct)), direct);
+        assert_eq!(canonical_url(&proxied(&proxied(direct))), proxied(direct));
+    }
+
+    #[test]
+    fn rejects_error_pages_as_installer() {
+        let html = format!("<!DOCTYPE html><html>404: Not Found</html>{}", "x".repeat(70 * 1024));
+        assert!(!plausible_installer(html.as_bytes()));
+        assert!(!plausible_installer(b"tiny"));
     }
 
     #[test]
