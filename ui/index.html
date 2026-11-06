@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>GPT Image Free</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 左侧窄栏：只放导航图标，最底部是头像 -->
+      <aside class="rail">
+        <div class="rail-top">
+          <button class="rail-logo" id="logoBtn" title="首页" aria-label="首页"></button>
+          <nav class="rail-nav" id="railNav" aria-label="导航"></nav>
+        </div>
+        <div class="rail-bottom">
+          <button class="version-chip" id="versionBtn" title="检查更新"></button>
+          <button class="avatar" id="avatarBtn" aria-haspopup="menu" aria-expanded="false">
+            <span id="avatarLetter">L</span>
+          </button>
+        </div>
+      </aside>
+
+      <!-- 头像菜单 -->
+      <div class="menu" id="avatarMenu" role="menu" hidden>
+        <div class="menu-head">
+          <div class="menu-avatar" id="menuAvatar">L</div>
+          <div class="menu-id">
+            <div class="menu-name" id="menuName">ligang</div>
+            <div class="menu-plan" id="menuPlan">本地客户端</div>
+          </div>
+        </div>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-route="overview" role="menuitem">
+          <span class="mi-icon"></span><span>剩余额度</span>
+        </button>
+        <button class="menu-item" data-route="pool" role="menuitem">
+          <span class="mi-icon"></span><span>号池管理</span>
+        </button>
+        <button class="menu-item" data-route="api" role="menuitem">
+          <span class="mi-icon"></span><span>API 接入</span>
+        </button>
+        <button class="menu-item" data-route="import" role="menuitem">
+          <span class="mi-icon"></span><span>高级导入</span>
+        </button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" data-route="settings" role="menuitem">
+          <span class="mi-icon"></span><span>插件设置</span>
+        </button>
+      </div>
+
+      <main class="stage" id="stage"></main>
+
+      <!-- 全局图片放大 -->
+      <div class="lightbox" id="lightbox" hidden>
+        <img id="lightboxImg" alt="" />
+        <button class="lightbox-close" id="lightboxClose" aria-label="关闭">×</button>
+      </div>
+
+      <div class="toast" id="toast" hidden></div>
+    </div>
+    <script src="app.js"></script>
+  </body>
+</html>

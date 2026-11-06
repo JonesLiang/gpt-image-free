@@ -1,0 +1,11 @@
+# 构建产物与本地缓存
+target/
+**/target/
+node_modules/
+ui/dist/
+*.log
+
+# 本地配置
+.env
+.env.local
+.DS_Store

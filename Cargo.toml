@@ -1,0 +1,11 @@
+[workspace]
+members = ["src-tauri"]
+resolver = "2"
+
+[profile.release]
+# 发布包体积优先：开 LTO + 只保留一个 codegen 单元，strip 掉符号。
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+panic = "abort"
