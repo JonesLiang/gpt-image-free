@@ -136,8 +136,9 @@ pub async fn oauth_finish(
     c.oauth_finish(&session_id, &callback).await.map_err(err)
 }
 
-/// 批量凭据一键授权入池：worker 完成 OAuth + TOTP 换 token，成功后统一写号池。
+/// 批量凭据一键授权入池：纯 Rust 完成 OAuth + TOTP 换 token，成功后统一写号池。
 /// 失败的账号原样返回，前端据此把原始行回填到输入框方便改完重试。
+/// 入池失败（例如本机后端没启动）不会整批丢掉已经换出的 token。
 #[tauri::command]
 pub async fn authorize_credentials(
     state: tauri::State<'_, AppState>,
@@ -147,7 +148,7 @@ pub async fn authorize_credentials(
     use std::collections::HashMap;
 
     let total = credentials.len();
-    // 拥有值而不是借用，这样 credentials 可以直接 move 给 worker，
+    // 拥有值而不是借用，这样 credentials 可以直接 move 给授权流程，
     // 后面仍能按邮箱找回原始密码 / 2FA 写进号池。
     let mut by_email: HashMap<String, (String, String, String)> = HashMap::new();
     for c in &credentials {
@@ -177,18 +178,22 @@ pub async fn authorize_credentials(
         }));
     }
     let succeeded = payloads.len();
-    let enrolled = if payloads.is_empty() {
-        serde_json::json!({ "added": 0, "skipped": 0, "errors": [] })
-    } else {
+    let mut enrolled = serde_json::json!({ "added": 0, "skipped": 0, "errors": [] });
+    let mut enroll_error = String::new();
+    if !payloads.is_empty() {
         let c = client(&state);
-        c.add_accounts(payloads).await.map_err(err)?
-    };
+        match c.add_accounts(payloads).await {
+            Ok(v) => enrolled = v,
+            Err(e) => enroll_error = err(e),
+        }
+    }
 
     Ok(serde_json::json!({
         "total": total,
         "succeeded": succeeded,
         "failed": total.saturating_sub(succeeded),
         "enrolled": enrolled,
+        "enroll_error": enroll_error,
         "results": output.results,
     }))
 }

@@ -1408,11 +1408,12 @@ dependencies = [
 
 [[package]]
 name = "gpt-image-free"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64 0.22.1",
  "directories",
  "reqwest 0.12.28",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
@@ -1420,6 +1421,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tokio",
+ "url",
 ]
 
 [[package]]

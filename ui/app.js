@@ -1568,6 +1568,29 @@ function rowsToText(rows) {
   }).filter(Boolean).join("\n");
 }
 
+/** 入池失败时把已经换出的 token 回填成「第 4 字段带 token」的行：
+    下次解析会走「自带未过期 token → 直接入池」，不用再登录一次。 */
+function refillAuthorizedTokens(results) {
+  const ok = (Array.isArray(results) ? results : []).filter((x) => x && x.ok && x.access_token);
+  const byEmail = new Map();
+  (imp.rows || []).forEach((row) => {
+    if (row && row.kind === "credential") byEmail.set(String(row.email || "").toLowerCase(), row);
+  });
+  const lines = ok.map((x) => {
+    const row = byEmail.get(String(x.email || "").toLowerCase());
+    if (!row || !row.password) return "";
+    // 第三字段必须非空（格式要求），token 有效时它的内容不再参与登录。
+    return [row.email, row.password, row.totp || "NONE", x.access_token, x.refresh_token || ""].join("----");
+  }).filter(Boolean);
+  if (!lines.length) return toast("没有可回填的 token", true);
+  imp.text = lines.join("\n");
+  imp.rows = null;
+  imp.parse = null;
+  imp.result = null;
+  render();
+  toast(`已回填 ${lines.length} 条带 token 的行，后端启动后可直接入池`);
+}
+
 function renderImportStats(host) {
   host.innerHTML = "";
   const rows = imp.rows || [];
@@ -1638,12 +1661,22 @@ function renderImportResult(host) {
   }
   if (r.credCount) {
     lines.push(auth.unavailable
-      ? `凭据 ${r.credCount} 条：自动授权不可用`
+      ? `凭据 ${r.credCount} 条：自动授权未执行`
       : `凭据 ${r.credCount} 条：成功 ${Number(auth.succeeded) || 0}，失败 ${Number(auth.failed) || 0}，入池新增 ${Number(enrolled.added) || 0}`);
   }
   box.appendChild(el("div", { class: "imp-result-title", text: lines.join("　|　") || "本次没有可处理的数据" }));
   if (auth.unavailable) {
     box.appendChild(el("div", { class: "imp-result-errors", text: String(auth.unavailable) }));
+  }
+  if (auth.enroll_error) {
+    box.appendChild(el("div", {
+      class: "imp-result-errors",
+      text: `token 已换出，但写入号池失败：${auth.enroll_error}。通常是本机后端没启动；启动后把下面回填的行再导入一次即可。`,
+    }));
+    box.appendChild(el("button", {
+      class: "btn", text: "回填已换出的 token（可直接入池）",
+      onclick: () => refillAuthorizedTokens(auth.results),
+    }));
   }
   const tokenErrors = Array.isArray(token.errors) ? token.errors : [];
   if (tokenErrors.length) {
@@ -1681,7 +1714,7 @@ function renderOAuth(host) {
   if (!imp.oauth) {
     box.appendChild(el("p", {
       class: "imp-hint",
-      text: "当自动授权环境不可用、或上游要求邮箱验证码时，可以在这里逐个用系统浏览器完成登录，再把 callback URL 贴回来换 token。一次只处理一个账号。",
+      text: "当自动授权被风控拦截、或上游要求邮箱验证码时，可以在这里逐个用系统浏览器完成登录，再把 callback URL 贴回来换 token。一次只处理一个账号。",
     }));
     if (!pending.length) {
       box.appendChild(el("p", { class: "imp-hint", text: "当前没有待授权的凭据行。" }));
@@ -1799,7 +1832,11 @@ function renderImport(stage) {
   }));
   note.appendChild(el("div", {
     class: "imp-note-body",
-    text: "自带未过期 token 的行直接写入号池；只有邮箱密码的行由本机 OAuth + TOTP 自动换 token 后入池。密码保留原样、重复邮箱自动跳过，失败行可一键回填重试。",
+    text: "自带未过期 token 的行直接写入号池；只有邮箱密码的行由客户端内置的 OAuth + TOTP 自动换 token 后入池，不需要 Python 或任何额外运行时。密码保留原样、重复邮箱自动跳过，失败行可一键回填重试。",
+  }));
+  note.appendChild(el("div", {
+    class: "imp-note-body",
+    text: "自动授权会访问 auth.openai.com，需要能连通上游的网络；代理一栏留空时会自动读取系统代理并探测常见本地端口。上游若要求邮箱验证码，自动登录无法完成，可展开下方手动 OAuth 授权。",
   }));
   page.appendChild(note);
 
@@ -1950,7 +1987,7 @@ function renderImport(stage) {
           );
         } catch (e) {
           authResult = { unavailable: String(e && e.message ? e.message : e), results: [] };
-          creds.forEach((r) => failures.push({ email: r.email, error: "自动授权不可用" }));
+          creds.forEach((r) => failures.push({ email: r.email, error: "自动授权未执行" }));
         }
       }
       imp.result = { tokenResult, authResult, failures, tokenCount, credCount };

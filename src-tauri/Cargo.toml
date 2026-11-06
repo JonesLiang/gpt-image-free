@@ -1,6 +1,6 @@
 [package]
 name = "gpt-image-free"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 rust-version = "1.77"
 description = "GPT Image Free — a fast, Codex-styled desktop client for the local chatgpt2api account pool"
@@ -23,4 +23,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio = { version = "1", features = ["time", "sync", "rt", "macros"] }
 base64 = "0.22"
 sha2 = "0.10"
+ring = "0.17"
+url = "2"
 directories = "5"
