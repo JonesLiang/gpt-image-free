@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 pub const REPO: &str = "JonesLiang/gpt-image-free";
+/// GitHub 网页域名。查版本只读它的 302 跳转，不占用 API 配额。
+pub const GITHUB: &str = "https://github.com";
 /// gh-proxy 前缀：把 https://<host>/<path> 换成 <proxy>/https://<host>/<path>。
 pub const GH_PROXY: &str = "https://gh-proxy.com";
 
@@ -59,78 +61,139 @@ pub fn proxied(url: &str) -> String {
     format!("{GH_PROXY}/{}", url)
 }
 
-#[derive(serde::Deserialize)]
-struct GhRelease {
-    #[serde(default)]
-    tag_name: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    html_url: String,
-    #[serde(default)]
-    assets: Vec<GhAsset>,
-}
-
-#[derive(serde::Deserialize)]
-struct GhAsset {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    browser_download_url: String,
-}
-
-/// 当前平台首选的安装包后缀。
-fn preferred_asset_suffix() -> &'static str {
-    if cfg!(target_os = "windows") {
-        ".msi"
-    } else if cfg!(target_os = "macos") {
-        ".dmg"
-    } else {
-        ".AppImage"
+/// 从指向 /releases/tag/vX.Y.Z 的地址里取出 tag。
+///
+/// 输入可能是 Location 头，也可能是整页 HTML。整页 HTML 里还会出现
+/// GitHub 自己的路由模板 `/:user_id/:repository/releases/tag/*name`，
+/// 所以必须跳过所有非版本号开头的命中，取第一个合法的。
+fn tag_from_location(location: &str) -> Option<String> {
+    const MARK: &str = "/releases/tag/";
+    let mut from = 0usize;
+    while let Some(rel) = location[from..].find(MARK) {
+        let start = from + rel + MARK.len();
+        let tag: String = location[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-' || *c == '_')
+            .collect();
+        // 必须以数字开头（tag 形如 v1.2.3 或 1.2.3），且要看得到数字，
+        // 这样能滤掉 `*name`、`%7B` 这类模板片段。
+        if tag.starts_with(|c: char| c.is_ascii_digit())
+            || (tag.len() > 1
+                && matches!(tag.as_bytes()[0], b'v' | b'V')
+                && tag.as_bytes()[1].is_ascii_digit())
+        {
+            return Some(tag);
+        }
+        from = start;
     }
+    None
 }
 
-fn asset_url(assets: &[GhAsset]) -> Option<String> {
-    let want = preferred_asset_suffix();
-    assets
-        .iter()
-        .find(|a| a.name.ends_with(want))
-        .or_else(|| assets.iter().find(|a| !a.name.ends_with(".sig")))
-        .map(|a| a.browser_download_url.clone())
-        .filter(|u| !u.is_empty())
+/// 从 HTML 里兜底找 tag（等价的另一个入口，语义上区分来源）。
+fn tag_from_html(html: &str) -> Option<String> {
+    tag_from_location(html)
+}
+
+/// 当前平台安装包的完整文件名后缀。
+///
+/// 文件名规则来自 release.yml 的产物：
+///   Windows  GPT.Image.Free_<v>_x64-setup.exe
+///   macOS    GPT.Image.Free_<v>_aarch64.dmg / _x64.dmg
+///   Linux    GPT.Image.Free_<v>_amd64.AppImage
+fn asset_suffix() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "_x64-setup.exe"
+    } else if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "_aarch64.dmg"
+        } else {
+            "_x64.dmg"
+        }
+    } else {
+        "_amd64.AppImage"
+    }
 }
 
 /// 查询最新发布版本。
+///
+/// 不用 api.github.com：匿名调用每小时只有 60 次配额，用户点几次「检查更新」
+/// 就会 403。这里请求 releases/latest，只读它的 302 跳转地址
+/// （/releases/tag/vX.Y.Z）来拿版本号，完全不计入 API 配额。
 pub async fn check_update(current: &str) -> Result<ReleaseInfo, String> {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
+        // 必须手动关掉重定向，才能读到 Location 头。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| e.to_string())?;
-    // GitHub API 要求 User-Agent。
-    let resp = http
-        .get(format!("https://api.github.com/repos/{REPO}/releases/latest"))
-        .header("User-Agent", "gpt-image-free-updater")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("检查更新失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("检查更新失败：HTTP {}", resp.status().as_u16()));
+
+    let candidates = [
+        proxied(&format!("{GITHUB}/{REPO}/releases/latest")),
+        format!("{GITHUB}/{REPO}/releases/latest"),
+    ];
+    let mut last_err = String::new();
+    for url in candidates {
+        let resp = match http
+            .get(&url)
+            .header("User-Agent", "gpt-image-free-updater")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // 某个镜像不通就换下一个。
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        // 有发布时 GitHub 返回 302（可能多跳一次到同一 tag）。
+        if let Some(tag) = tag_from_location(&location) {
+            return Ok(build_info(&tag, current));
+        }
+        // 镜像吃掉了跳转、直接回 200：从页面内容里再找一次。
+        if status.is_success() {
+            if let Ok(body) = resp.text().await {
+                if let Some(tag) = tag_from_location(&body).or_else(|| tag_from_html(&body)) {
+                    return Ok(build_info(&tag, current));
+                }
+            }
+            last_err = "HTTP 200（页面里没找到版本号）".into();
+            continue;
+        }
+        last_err = format!("HTTP {}", status.as_u16());
+        if !location.is_empty() {
+            last_err.push_str(&format!("，Location={location}"));
+        }
     }
-    let rel: GhRelease = resp
-        .json()
-        .await
-        .map_err(|e| format!("发布信息解析失败：{e}"))?;
-    let direct = asset_url(&rel.assets);
-    Ok(ReleaseInfo {
-        has_update: is_newer(&rel.tag_name, current),
-        latest: rel.tag_name.trim_start_matches('v').to_string(),
+    Err(format!(
+        "检查更新失败：{last_err}。仓库还没有发布版本时这是正常的"
+    ))
+}
+
+/// 由 tag 推出下载地址。文件名规则由 release.yml 的产物决定：
+/// `GPT.Image.Free_<版本>_<架构>.<后缀>`。
+fn build_info(tag: &str, current: &str) -> ReleaseInfo {
+    let version = tag.trim_start_matches('v').to_string();
+    let direct = format!(
+        "{GITHUB}/{REPO}/releases/download/{tag}/GPT.Image.Free_{version}{}",
+        asset_suffix()
+    );
+    ReleaseInfo {
+        has_update: is_newer(tag, current),
+        latest: version,
         current: current.to_string(),
-        proxy_url: direct.as_deref().map(proxied),
-        direct_url: direct,
-        notes: rel.body,
-        page_url: rel.html_url,
-    })
+        proxy_url: Some(proxied(&direct)),
+        direct_url: Some(direct),
+        notes: String::new(),
+        page_url: format!("{GITHUB}/{REPO}/releases/tag/{tag}"),
+    }
 }
 
 fn updates_dir() -> PathBuf {
@@ -220,19 +283,49 @@ mod tests {
     }
 
     #[test]
-    fn picks_preferred_asset() {
-        let assets = vec![
-            GhAsset {
-                name: "app.AppImage".into(),
-                browser_download_url: "https://x/app.AppImage".into(),
-            },
-            GhAsset {
-                name: "app.dmg".into(),
-                browser_download_url: "https://x/app.dmg".into(),
-            },
-        ];
-        let picked = asset_url(&assets).unwrap();
-        // 按当前平台选，只断言选到了非签名文件。
-        assert!(picked.ends_with(preferred_asset_suffix()) || !picked.is_empty());
+    fn reads_tag_from_redirect() {
+        assert_eq!(
+            tag_from_location("https://github.com/a/b/releases/tag/v1.2.3"),
+            Some("v1.2.3".into())
+        );
+        // 多跳一层或带查询串也要能认出来。
+        assert_eq!(
+            tag_from_location("https://gh-proxy.com/https://github.com/a/b/releases/tag/v0.4.1?x=1"),
+            Some("v0.4.1".into())
+        );
+        assert_eq!(tag_from_location("https://github.com/a/b/releases"), None);
+        assert_eq!(tag_from_location(""), None);
+    }
+
+    #[test]
+    fn reads_tag_from_html_when_proxy_swallows_redirect() {
+        // gh-proxy 直接回 200，只能从页面里捞链接。
+        let html = r#"<a href="https://github.com/a/b/releases/tag/v0.3.2">v0.3.2</a>"#;
+        assert_eq!(tag_from_html(html).as_deref(), Some("v0.3.2"));
+        assert_eq!(tag_from_html("<html>nothing</html>"), None);
+    }
+
+    #[test]
+    fn skips_route_template_in_page_head() {
+        // 真实页面前半段有 GitHub 自己的路由模板，不能当版本号。
+        let page = concat!(
+            r#"<meta name="route-pattern" content="/:user_id/:repository/releases/tag/*name">"#,
+            r#"<a href="https://github.com/a/b/releases/tag/v0.1.0">"#,
+        );
+        assert_eq!(tag_from_location(page).as_deref(), Some("v0.1.0"));
+        assert_eq!(tag_from_location("/releases/tag/*name"), None);
+        assert_eq!(tag_from_location("/releases/tag/%7Bname%7D"), None);
+    }
+
+    #[test]
+    fn builds_download_url_from_tag() {
+        let info = build_info("v0.2.0", "0.1.0");
+        assert!(info.has_update);
+        assert_eq!(info.latest, "0.2.0");
+        let url = info.direct_url.unwrap();
+        assert!(url.contains("/releases/download/v0.2.0/GPT.Image.Free_0.2.0"));
+        assert!(url.ends_with(asset_suffix()));
+        // 代理地址一定是代理前缀 + 原始直连地址。
+        assert_eq!(info.proxy_url.unwrap(), proxied(&url));
     }
 }

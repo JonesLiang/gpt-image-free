@@ -5,18 +5,18 @@
    ========================================================================= */
 
 :root {
-  --bg: #0d0d0f;
-  --bg-elev: #141417;
-  --bg-hover: #1a1a1e;
-  --bg-active: #202025;
-  --panel: #111113;
+  --bg: #1a1a1e;
+  --bg-elev: #242429;
+  --bg-hover: #2c2c32;
+  --bg-active: #34343b;
+  --panel: #202024;
 
-  --line: #232329;
-  --line-strong: #2e2e36;
+  --line: #333340;
+  --line-strong: #43434f;
 
   --text: #ececf1;
-  --text-dim: #9a9aa5;
-  --text-faint: #66666f;
+  --text-dim: #a8a8b6;
+  --text-faint: #8e8e99;
 
   --accent: #7aa2f7;
   --accent-dim: #5b7fd4;
@@ -76,7 +76,7 @@ select {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2a2a31;
+  background: #3a3a44;
   border-radius: 8px;
   border: 3px solid var(--bg);
 }
@@ -734,7 +734,7 @@ select {
 }
 
 .table tr:hover td {
-  background: rgba(255, 255, 255, 0.014);
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .mono {
